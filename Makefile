@@ -6,6 +6,7 @@ CFLAGS   := -nostdlib -ffreestanding -static -O3 -march=native -pipe \
 ASFLAGS  := -nostdlib -static
 LDFLAGS  := -nostdlib -static -Wl,--gc-sections -Wl,--strip-all -fuse-ld=lld
 TARGET   := build/crom
+PREFIX   := /usr/local
 SRCDIR   := src
 SRCS     := $(wildcard $(SRCDIR)/*.c)
 ASMS     := start clone
@@ -23,7 +24,7 @@ build/%.o: $(SRCDIR)/%.S
 	@mkdir -p build
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
-.PHONY: clean run test
+.PHONY: clean run test install uninstall
 
 clean:
 	rm -rf build
@@ -33,3 +34,10 @@ run: $(TARGET)
 
 test: $(TARGET)
 	$(TARGET) '*.c' 2>&1 || true
+
+install: $(TARGET)
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/crom
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/crom

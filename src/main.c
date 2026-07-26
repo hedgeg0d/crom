@@ -162,6 +162,7 @@ int crom_main(int argc, char **argv) {
 
     if (pool) {
         pool_flush(pool);
+        g_matches = pool->matches;
     }
 
     if (g_bar) display_done(g_dirs, g_files, g_matches, 0);

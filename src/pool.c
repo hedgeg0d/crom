@@ -111,6 +111,7 @@ static i64 worker_fn(void *arg) {
         if (g_needle) match = search_file(path);
 
         if (match) {
+            atomic_xadd(&p->matches, 1);
             out_lock();
             write_all(STDOUT_FILENO, path, len);
             write_all(STDOUT_FILENO, "\n", 1);

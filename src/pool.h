@@ -18,6 +18,7 @@ typedef struct {
     volatile i64 tail;
     volatile i64 done;
     volatile i64 pending;
+    volatile i64 matches;
     Arena arena;
     i64 num_workers;
 } Pool;

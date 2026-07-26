@@ -88,25 +88,52 @@ void display_done(i64 dirs, i64 files, i64 matches, i64 elapsed_us) {
     i64 now_ns = ts.sec * 1000000000L + ts.nsec;
     i64 ms = (now_ns - g_start_ns) / 1000000;
 
-    char buf[128];
+    char buf[160];
     i64 pos = 0;
     buf[pos++] = '\r';
     buf[pos++] = '\033';
     buf[pos++] = '[';
     buf[pos++] = 'K';
+    buf[pos++] = '\033';
+    buf[pos++] = '[';
+    buf[pos++] = '1';
+    buf[pos++] = ';';
+    buf[pos++] = '3';
+    buf[pos++] = '2';
+    buf[pos++] = 'm';
 
     pos += fmt_num(buf + pos, dirs);
+    buf[pos++] = ' ';
     buf[pos++] = 'd';
-    buf[pos++] = ' ';
-    pos += fmt_num(buf + pos, files);
-    buf[pos++] = 'f';
-    buf[pos++] = ' ';
-    pos += fmt_num(buf + pos, matches);
-    buf[pos++] = 'm';
-    buf[pos++] = ' ';
     buf[pos++] = 'i';
-    buf[pos++] = 'n';
+    buf[pos++] = 'r';
+    buf[pos++] = 's';
     buf[pos++] = ' ';
+
+    pos += fmt_num(buf + pos, files);
+    buf[pos++] = ' ';
+    buf[pos++] = 'f';
+    buf[pos++] = 'i';
+    buf[pos++] = 'l';
+    buf[pos++] = 'e';
+    buf[pos++] = 's';
+    buf[pos++] = ' ';
+
+    pos += fmt_num(buf + pos, matches);
+    buf[pos++] = ' ';
+    buf[pos++] = 'm';
+    buf[pos++] = 'a';
+    buf[pos++] = 't';
+    buf[pos++] = 'c';
+    buf[pos++] = 'h';
+    buf[pos++] = 'e';
+    buf[pos++] = 's';
+    buf[pos++] = ' ';
+
+    buf[pos++] = '\033';
+    buf[pos++] = '[';
+    buf[pos++] = '0';
+    buf[pos++] = 'm';
     pos += fmt_time(buf + pos, ms);
 
     buf[pos++] = '\n';
