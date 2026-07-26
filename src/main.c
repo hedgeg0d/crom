@@ -5,6 +5,7 @@
 #include "match_name.h"
 #include "pool.h"
 #include "display.h"
+#include "ignore.h"
 
 static const char *prog = "crom";
 static const char *pattern;
@@ -17,6 +18,7 @@ static volatile i64 g_dirs;
 static volatile i64 g_files;
 static volatile i64 g_matches;
 static i64 g_bar;
+static i64 g_use_ignore = 1;
 
 static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;30m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\033[0m\n");
@@ -130,6 +132,10 @@ int crom_main(int argc, char **argv) {
             g_bar = 1;
             continue;
         }
+        if (str_eq(argv[i], "--no-ignore")) {
+            g_use_ignore = 0;
+            continue;
+        }
         if (argv[i][0] != '-') {
             if (argv[i][0] == '/' || argv[i][0] == '.' || argv[i][0] == '~') {
                 if (!target) target = argv[i];
@@ -144,6 +150,7 @@ int crom_main(int argc, char **argv) {
     if (num_threads <= 0) num_threads = 1;
 
     if (g_bar) display_init();
+    ignore_set_enabled(g_use_ignore);
 
     if (needle) {
         pool = &pool_data;

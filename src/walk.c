@@ -2,6 +2,7 @@
 #include "syscalls.h"
 #include "util.h"
 #include "arena.h"
+#include "ignore.h"
 
 #define BUF_SZ 8192
 #define PATH_SZ 4096
@@ -44,8 +45,8 @@ static void walk_dir(WalkState *ws) {
             if (name[0] == '.') {
                 if (name[1] == 0) goto skip;
                 if (name[1] == '.' && name[2] == 0) goto skip;
-                if (name[1] == 'g' && name[2] == 'i' && name[3] == 't' && name[4] == 0) goto skip;
             }
+            if (d->d_type == DT_DIR && match_ignore(name, 1)) goto skip;
 
             i64 name_len = str_len(name);
             if (prefix_len + name_len >= PATH_SZ - 1) goto skip;
