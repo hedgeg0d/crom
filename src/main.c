@@ -4,6 +4,7 @@
 #include "walk.h"
 #include "match_name.h"
 #include "pool.h"
+#include "display.h"
 
 static const char *prog = "crom";
 static const char *pattern;
@@ -12,6 +13,10 @@ static i64 needle_len;
 static i64 num_threads;
 static Pool pool_data;
 static Pool *pool;
+static volatile i64 g_dirs;
+static volatile i64 g_files;
+static volatile i64 g_matches;
+static i64 g_bar;
 
 static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;30m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\033[0m\n");
@@ -44,6 +49,16 @@ static void usage(void) {
 
 static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
     (void)ctx;
+
+    if (dtype == DT_DIR) {
+        g_dirs++;
+        if (g_bar && (g_dirs & 63) == 0) display_update(g_dirs, g_files, g_matches);
+    } else if (dtype == DT_REG) {
+        g_files++;
+    } else {
+        return;
+    }
+
     if (dtype != DT_REG) return;
 
     if (pattern) {
@@ -55,6 +70,8 @@ static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
     if (pool) {
         pool_push(pool, path, len, dtype);
     } else {
+        g_matches++;
+        if (g_bar && (g_matches & 15) == 0) display_update(g_dirs, g_files, g_matches);
         write_all(STDOUT_FILENO, path, len);
         write_all(STDOUT_FILENO, "\n", 1);
     }
@@ -109,6 +126,10 @@ int crom_main(int argc, char **argv) {
             if (i + 1 < argc) num_threads = parse_int(argv[++i]);
             continue;
         }
+        if (str_eq(argv[i], "--bar")) {
+            g_bar = 1;
+            continue;
+        }
         if (argv[i][0] != '-') {
             if (argv[i][0] == '/' || argv[i][0] == '.' || argv[i][0] == '~') {
                 if (!target) target = argv[i];
@@ -122,6 +143,8 @@ int crom_main(int argc, char **argv) {
     if (!pattern && !needle) pattern = "*";
     if (num_threads <= 0) num_threads = 1;
 
+    if (g_bar) display_init();
+
     if (needle) {
         pool = &pool_data;
         pool_init(pool, num_threads);
@@ -133,6 +156,8 @@ int crom_main(int argc, char **argv) {
     if (pool) {
         pool_flush(pool);
     }
+
+    if (g_bar) display_done(g_dirs, g_files, g_matches, 0);
 
     return 0;
 }

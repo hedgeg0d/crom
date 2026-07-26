@@ -32,8 +32,9 @@
 #define SYS_io_uring_setup   425
 #define SYS_io_uring_enter   426
 #define SYS_io_uring_register 427
-#define SYS_openat2      437
-#define SYS_getrandom    318
+#define SYS_openat2          437
+#define SYS_getrandom        318
+#define SYS_clock_gettime    228
 
 #define AT_FDCWD  ((long)-100)
 #define AT_EMPTY_PATH  0x1000
@@ -129,6 +130,9 @@
 #define SEEK_SET  0
 #define SEEK_CUR  1
 #define SEEK_END  2
+
+#define CLOCK_MONOTONIC 1
+#define CLOCK_REALTIME  0
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
