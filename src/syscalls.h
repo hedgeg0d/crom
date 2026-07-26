@@ -5,6 +5,8 @@
 #define SYS_write          1
 #define SYS_open           2
 #define SYS_close          3
+#define SYS_fstat          5
+#define SYS_lseek          8
 #define SYS_mmap           9
 #define SYS_munmap        11
 #define SYS_brk           12
@@ -123,6 +125,10 @@
 #define IORING_OP_CLOSE     19
 #define IORING_OP_STATX     30
 #define IOSQE_FIXED_FILE    (1U << 0)
+
+#define SEEK_SET  0
+#define SEEK_CUR  1
+#define SEEK_END  2
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1

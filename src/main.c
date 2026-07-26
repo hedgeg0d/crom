@@ -4,9 +4,12 @@
 #include "arena.h"
 #include "walk.h"
 #include "match_name.h"
+#include "match_content.h"
 
 static const char *prog = "crom";
 static const char *pattern = 0;
+static const char *needle = 0;
+static i64 needle_len = 0;
 
 static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;30m┌───────────────────────────────────────────┐\033[0m\n");
@@ -37,14 +40,38 @@ static void usage(void) {
     write_str(STDOUT_FILENO, "  crom '**/test*' --bar         Test files, with progress\n");
 }
 
+static i64 search_content(const char *path) {
+    i64 fd = syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
+    if (fd < 0) return 0;
+
+    i64 size = syscall3(SYS_lseek, fd, 0, SEEK_END);
+    if (size <= 0) { syscall1(SYS_close, fd); return 0; }
+
+    void *data = (void *)syscall6(SYS_mmap, 0, (unsigned long)size,
+                                   PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { syscall1(SYS_close, fd); return 0; }
+
+    i64 found = content_search((const u8 *)data, size, needle, needle_len);
+
+    syscall2(SYS_munmap, (long)data, (unsigned long)size);
+    syscall1(SYS_close, fd);
+    return found;
+}
+
 static void print_file(const char *path, i64 len, u8 dtype, void *ctx) {
     (void)ctx;
     if (dtype != DT_REG) return;
+
     if (pattern) {
         const char *name = path + len;
         while (name > path && name[-1] != '/') name--;
         if (!match_glob(pattern, name)) return;
     }
+
+    if (needle) {
+        if (!search_content(path)) return;
+    }
+
     write_all(STDOUT_FILENO, path, len);
     write_all(STDOUT_FILENO, "\n", 1);
 }
@@ -81,6 +108,13 @@ int crom_main(int argc, char **argv) {
             if (i + 1 < argc) pattern = argv[++i];
             continue;
         }
+        if (str_eq(argv[i], "-c") || str_eq(argv[i], "--content")) {
+            if (i + 1 < argc) {
+                needle = argv[++i];
+                needle_len = str_len(needle);
+            }
+            continue;
+        }
         if (argv[i][0] != '-') {
             if (argv[i][0] == '/' || argv[i][0] == '.' || argv[i][0] == '~') {
                 if (!target) target = argv[i];
@@ -92,7 +126,7 @@ int crom_main(int argc, char **argv) {
 
     if (!target) target = ".";
 
-    if (!pattern) pattern = "*";
+    if (!pattern && !needle) pattern = "*";
 
     walk(target, print_file, 0);
     return 0;
