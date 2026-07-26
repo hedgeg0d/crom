@@ -44,6 +44,7 @@ static void walk_dir(WalkState *ws) {
             if (name[0] == '.') {
                 if (name[1] == 0) goto skip;
                 if (name[1] == '.' && name[2] == 0) goto skip;
+                if (name[1] == 'g' && name[2] == 'i' && name[3] == 't' && name[4] == 0) goto skip;
             }
 
             i64 name_len = str_len(name);

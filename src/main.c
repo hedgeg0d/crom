@@ -3,8 +3,10 @@
 #include "util.h"
 #include "arena.h"
 #include "walk.h"
+#include "match_name.h"
 
 static const char *prog = "crom";
+static const char *pattern = 0;
 
 static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;30m┌───────────────────────────────────────────┐\033[0m\n");
@@ -38,6 +40,11 @@ static void usage(void) {
 static void print_file(const char *path, i64 len, u8 dtype, void *ctx) {
     (void)ctx;
     if (dtype != DT_REG) return;
+    if (pattern) {
+        const char *name = path + len;
+        while (name > path && name[-1] != '/') name--;
+        if (!match_glob(pattern, name)) return;
+    }
     write_all(STDOUT_FILENO, path, len);
     write_all(STDOUT_FILENO, "\n", 1);
 }
@@ -59,6 +66,8 @@ int crom_main(int argc, char **argv) {
         return 0;
     }
 
+    const char *target = 0;
+
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "-h") || str_eq(argv[i], "--help")) {
             usage();
@@ -68,15 +77,22 @@ int crom_main(int argc, char **argv) {
             write_str(STDOUT_FILENO, "crom 0.1.0\n");
             return 0;
         }
-    }
-
-    const char *target = ".";
-    for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "-n") || str_eq(argv[i], "--name")) {
+            if (i + 1 < argc) pattern = argv[++i];
+            continue;
+        }
         if (argv[i][0] != '-') {
-            target = argv[i];
-            break;
+            if (argv[i][0] == '/' || argv[i][0] == '.' || argv[i][0] == '~') {
+                if (!target) target = argv[i];
+            } else {
+                if (!pattern) pattern = argv[i];
+            }
         }
     }
+
+    if (!target) target = ".";
+
+    if (!pattern) pattern = "*";
 
     walk(target, print_file, 0);
     return 0;
