@@ -1,88 +1,12 @@
 #include "syscalls.h"
+#include "types.h"
+#include "util.h"
+#include "arena.h"
+#include "walk.h"
 
-typedef unsigned long u64;
-typedef long i64;
-typedef unsigned int u32;
-typedef int i32;
-typedef unsigned char u8;
+static const char *prog = "crom";
 
-typedef struct {
-    void *buf;
-    i64 cap;
-    i64 len;
-    i64 pos;
-} Arena;
-
-static void *arena_alloc(Arena *a, i64 sz) {
-    sz = (sz + 15) & ~15L;
-    if (a->len + sz > a->cap) {
-        i64 nc = a->cap ? a->cap * 2 : 4096;
-        if (nc < a->len + sz) nc = a->len + sz;
-        nc = (nc + 4095) & ~4095L;
-        void *nb = (void *)syscall6(SYS_mmap, 0, nc, PROT_READ|PROT_WRITE,
-                                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-        if (nb == MAP_FAILED) return 0;
-        if (a->buf && a->cap) {
-            u8 *d = (u8 *)nb;
-            u8 *s = (u8 *)a->buf;
-            for (i64 i = 0; i < a->len; i++) d[i] = s[i];
-            syscall2(SYS_munmap, (long)a->buf, a->cap);
-        }
-        a->buf = nb;
-        a->cap = nc;
-    }
-    void *p = (u8 *)a->buf + a->len;
-    a->len += sz;
-    return p;
-}
-
-static void arena_free(Arena *a) {
-    if (a->buf && a->cap) syscall2(SYS_munmap, (long)a->buf, a->cap);
-    a->buf = 0; a->cap = 0; a->len = 0; a->pos = 0;
-}
-
-static i64 str_len(const char *s) {
-    const char *p = s;
-    while (*p) p++;
-    return p - s;
-}
-
-static i64 str_eq(const char *a, const char *b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == *b;
-}
-
-static i64 str_eqn(const char *a, const char *b, i64 n) {
-    for (i64 i = 0; i < n; i++) {
-        if (!a[i] || !b[i]) return 0;
-        if (a[i] != b[i]) return 0;
-    }
-    return 1;
-}
-
-static char *str_dup(Arena *a, const char *s) {
-    i64 n = str_len(s);
-    char *d = arena_alloc(a, n + 1);
-    if (!d) return 0;
-    for (i64 i = 0; i <= n; i++) d[i] = s[i];
-    return d;
-}
-
-static i64 write_all(i64 fd, const char *s, i64 len) {
-    i64 off = 0;
-    while (off < len) {
-        i64 n = syscall3(SYS_write, fd, (long)(s + off), (unsigned long)(len - off));
-        if (n < 0) return -1;
-        off += n;
-    }
-    return off;
-}
-
-static i64 write_str(i64 fd, const char *s) {
-    return write_all(fd, s, str_len(s));
-}
-
-static void usage(const char *prog) {
+static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;30m┌───────────────────────────────────────────┐\033[0m\n");
     write_str(STDOUT_FILENO, "\033[1;30m│\033[0m  \033[1;36mcrom\033[0m — the fast file hunter                \033[1;30m│\033[0m\n");
     write_str(STDOUT_FILENO, "\033[1;30m└───────────────────────────────────────────┘\033[0m\n\n");
@@ -111,22 +35,33 @@ static void usage(const char *prog) {
     write_str(STDOUT_FILENO, "  crom '**/test*' --bar         Test files, with progress\n");
 }
 
+static void print_file(const char *path, i64 len, u8 dtype, void *ctx) {
+    (void)ctx;
+    if (dtype != DT_REG) return;
+    write_all(STDOUT_FILENO, path, len);
+    write_all(STDOUT_FILENO, "\n", 1);
+}
+
 int crom_main(int argc, char **argv) {
-    const char *prog = argv[0];
-    if (prog && (str_eq(prog + str_len(prog) - 5, "/crom") ||
-                 str_eq(prog, "crom") ||
-                 (str_len(prog) >= 4 && str_eq(prog + str_len(prog) - 4, "crom")))) {
-        prog = "crom";
+    if (argv[0]) {
+        const char *p = argv[0];
+        i64 plen = str_len(p);
+        for (i64 i = plen - 1; i >= 0 && p[i] != '/'; i--) {
+            if (i == 0 || p[i-1] == '/') {
+                prog = p + i;
+                break;
+            }
+        }
     }
 
     if (argc < 2) {
-        usage(prog);
+        usage();
         return 0;
     }
 
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "-h") || str_eq(argv[i], "--help")) {
-            usage(prog);
+            usage();
             return 0;
         }
         if (str_eq(argv[i], "-V") || str_eq(argv[i], "--version")) {
@@ -135,8 +70,14 @@ int crom_main(int argc, char **argv) {
         }
     }
 
-    write_str(STDOUT_FILENO, "crom: not yet implemented\n");
-    return 1;
+    const char *target = ".";
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            target = argv[i];
+            break;
+        }
+    }
+
+    walk(target, print_file, 0);
+    return 0;
 }
-
-

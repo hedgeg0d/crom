@@ -22,13 +22,13 @@ build/start.o: $(SRCDIR)/start.S
 	@mkdir -p build
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
-.PHONY: clean run test
+.PHONY: clean run test install
 
 clean:
 	rm -rf build
 
 run: $(TARGET)
-	$(TARGET)
+	$(TARGET) .
 
 test: $(TARGET)
 	$(TARGET) '*.c' 2>&1 || true
