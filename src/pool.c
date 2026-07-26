@@ -33,7 +33,7 @@ static i64 search_file(const char *path) {
 
     void *data = (void *)syscall6(SYS_mmap, 0, (unsigned long)size,
                                    PROT_READ, MAP_PRIVATE, fd, 0);
-    if (data == MAP_FAILED) { syscall1(SYS_close, fd); return 0; }
+    if (is_mmap_err(data)) { syscall1(SYS_close, fd); return 0; }
 
     i64 found = content_search((const u8 *)data, size, g_needle, g_nlen);
 
@@ -47,6 +47,7 @@ void pool_init(Pool *p, i64 workers) {
     p->tail = 0;
     p->done = 0;
     p->pending = 0;
+    p->matches = 0;
     p->num_workers = workers > 0 ? workers : 1;
 }
 
@@ -74,6 +75,8 @@ static i64 pop_item(Pool *p, char **path, i64 *len, u8 *dtype) {
 }
 
 i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
+    if (len >= POOL_PATH_SZ) return -1;
+
     for (;;) {
         i64 h = atomic_load(&p->head);
         i64 t = atomic_load(&p->tail);
@@ -83,10 +86,8 @@ i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
         }
 
         PoolItem *it = &p->items[h & (POOL_QUEUE_CAP - 1)];
-        i64 psz = len + 1;
-        it->path = arena_alloc(&p->arena, psz);
-        if (!it->path) return -1;
-        for (i64 i = 0; i <= len; i++) it->path[i] = path[i];
+        for (i64 i = 0; i < len; i++) it->path[i] = path[i];
+        it->path[len] = 0;
         it->len = len;
         it->dtype = dtype;
 
@@ -129,7 +130,7 @@ static void spawn_worker(Pool *p) {
     void *stk = (void *)syscall6(SYS_mmap, 0, (unsigned long)stksz,
                                   PROT_READ|PROT_WRITE,
                                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (stk == MAP_FAILED) return;
+    if (is_mmap_err(stk)) return;
 
     u64 sp = (u64)stk + stksz;
     sp &= ~15ULL;
@@ -187,6 +188,4 @@ void pool_flush(Pool *p) {
         if (h == t && pend == 0) break;
         syscall1(SYS_sched_yield, 0);
     }
-
-    arena_free(&p->arena);
 }

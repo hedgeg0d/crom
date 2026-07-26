@@ -11,9 +11,7 @@ static const char *DIRS[] = {
     ".hg",
     ".idea",
     ".vscode",
-    "target",
-    "build",
-    "dist",
+    ".mypy_cache",
     0
 };
 

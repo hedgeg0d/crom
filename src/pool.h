@@ -4,10 +4,11 @@
 #include "types.h"
 #include "arena.h"
 
-#define POOL_QUEUE_CAP 4096
+#define POOL_QUEUE_CAP 256
+#define POOL_PATH_SZ   1024
 
 typedef struct {
-    char *path;
+    char path[POOL_PATH_SZ];
     i64 len;
     u8 dtype;
 } PoolItem;
@@ -19,7 +20,6 @@ typedef struct {
     volatile i64 done;
     volatile i64 pending;
     volatile i64 matches;
-    Arena arena;
     i64 num_workers;
 } Pool;
 

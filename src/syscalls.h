@@ -8,6 +8,7 @@
 #define SYS_fstat          5
 #define SYS_lseek          8
 #define SYS_mmap           9
+#define SYS_mremap        25
 #define SYS_munmap        11
 #define SYS_brk           12
 #define SYS_nanosleep     35
@@ -97,6 +98,11 @@
 #define MAP_ANONYMOUS 0x20
 #define MAP_POPULATE  0x08000
 #define MAP_FAILED    ((void *)-1)
+
+static inline long is_mmap_err(void *p) {
+    long v = (long)p;
+    return v < 0 && v > -4096;
+}
 
 #define FUTEX_WAIT        0
 #define FUTEX_WAKE        1
