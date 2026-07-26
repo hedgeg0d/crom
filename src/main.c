@@ -1,20 +1,22 @@
 #include "syscalls.h"
 #include "types.h"
 #include "util.h"
-#include "arena.h"
 #include "walk.h"
 #include "match_name.h"
-#include "match_content.h"
+#include "pool.h"
 
 static const char *prog = "crom";
-static const char *pattern = 0;
-static const char *needle = 0;
-static i64 needle_len = 0;
+static const char *pattern;
+static const char *needle;
+static i64 needle_len;
+static i64 num_threads;
+static Pool pool_data;
+static Pool *pool;
 
 static void usage(void) {
-    write_str(STDOUT_FILENO, "\033[1;30m┌───────────────────────────────────────────┐\033[0m\n");
-    write_str(STDOUT_FILENO, "\033[1;30m│\033[0m  \033[1;36mcrom\033[0m — the fast file hunter                \033[1;30m│\033[0m\n");
-    write_str(STDOUT_FILENO, "\033[1;30m└───────────────────────────────────────────┘\033[0m\n\n");
+    write_str(STDOUT_FILENO, "\033[1;30m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\033[0m\n");
+    write_str(STDOUT_FILENO, "\033[1;30m\xe2\x94\x82\033[0m  \033[1;36mcrom\033[0m \xe2\x80\x94 the fast file hunter                \033[1;30m\xe2\x94\x82\033[0m\n");
+    write_str(STDOUT_FILENO, "\033[1;30m\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x98\033[0m\n\n");
     write_str(STDOUT_FILENO, "\033[1mUsage:\033[0m ");
     write_str(STDOUT_FILENO, prog);
     write_str(STDOUT_FILENO, " [options] [pattern] [path...]\n\n");
@@ -40,25 +42,7 @@ static void usage(void) {
     write_str(STDOUT_FILENO, "  crom '**/test*' --bar         Test files, with progress\n");
 }
 
-static i64 search_content(const char *path) {
-    i64 fd = syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
-    if (fd < 0) return 0;
-
-    i64 size = syscall3(SYS_lseek, fd, 0, SEEK_END);
-    if (size <= 0) { syscall1(SYS_close, fd); return 0; }
-
-    void *data = (void *)syscall6(SYS_mmap, 0, (unsigned long)size,
-                                   PROT_READ, MAP_PRIVATE, fd, 0);
-    if (data == MAP_FAILED) { syscall1(SYS_close, fd); return 0; }
-
-    i64 found = content_search((const u8 *)data, size, needle, needle_len);
-
-    syscall2(SYS_munmap, (long)data, (unsigned long)size);
-    syscall1(SYS_close, fd);
-    return found;
-}
-
-static void print_file(const char *path, i64 len, u8 dtype, void *ctx) {
+static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
     (void)ctx;
     if (dtype != DT_REG) return;
 
@@ -68,12 +52,18 @@ static void print_file(const char *path, i64 len, u8 dtype, void *ctx) {
         if (!match_glob(pattern, name)) return;
     }
 
-    if (needle) {
-        if (!search_content(path)) return;
+    if (pool) {
+        pool_push(pool, path, len, dtype);
+    } else {
+        write_all(STDOUT_FILENO, path, len);
+        write_all(STDOUT_FILENO, "\n", 1);
     }
+}
 
-    write_all(STDOUT_FILENO, path, len);
-    write_all(STDOUT_FILENO, "\n", 1);
+static i64 parse_int(const char *s) {
+    i64 v = 0;
+    for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
+    return v;
 }
 
 int crom_main(int argc, char **argv) {
@@ -115,6 +105,10 @@ int crom_main(int argc, char **argv) {
             }
             continue;
         }
+        if (str_eq(argv[i], "-j") || str_eq(argv[i], "--threads")) {
+            if (i + 1 < argc) num_threads = parse_int(argv[++i]);
+            continue;
+        }
         if (argv[i][0] != '-') {
             if (argv[i][0] == '/' || argv[i][0] == '.' || argv[i][0] == '~') {
                 if (!target) target = argv[i];
@@ -125,9 +119,20 @@ int crom_main(int argc, char **argv) {
     }
 
     if (!target) target = ".";
-
     if (!pattern && !needle) pattern = "*";
+    if (num_threads <= 0) num_threads = 1;
 
-    walk(target, print_file, 0);
+    if (needle) {
+        pool = &pool_data;
+        pool_init(pool, num_threads);
+        pool_spawn(pool, needle, needle_len);
+    }
+
+    walk(target, on_file, 0);
+
+    if (pool) {
+        pool_flush(pool);
+    }
+
     return 0;
 }

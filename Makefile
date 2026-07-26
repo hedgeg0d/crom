@@ -8,7 +8,8 @@ LDFLAGS  := -nostdlib -static -Wl,--gc-sections -Wl,--strip-all -fuse-ld=lld
 TARGET   := build/crom
 SRCDIR   := src
 SRCS     := $(wildcard $(SRCDIR)/*.c)
-OBJS     := $(patsubst $(SRCDIR)/%.c,build/%.o,$(SRCS)) build/start.o
+ASMS     := start clone
+OBJS     := $(patsubst $(SRCDIR)/%.c,build/%.o,$(SRCS)) $(patsubst %,build/%.o,$(ASMS))
 
 $(TARGET): $(OBJS)
 	@mkdir -p build
@@ -18,11 +19,11 @@ build/%.o: $(SRCDIR)/%.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-build/start.o: $(SRCDIR)/start.S
+build/%.o: $(SRCDIR)/%.S
 	@mkdir -p build
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
-.PHONY: clean run test install
+.PHONY: clean run test
 
 clean:
 	rm -rf build
