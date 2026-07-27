@@ -4,7 +4,7 @@
 #include "types.h"
 #include "arena.h"
 
-#define POOL_QUEUE_CAP 256
+#define POOL_QUEUE_CAP 1024
 #define POOL_PATH_SZ   1024
 
 typedef struct {

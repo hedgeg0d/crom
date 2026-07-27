@@ -83,9 +83,13 @@ i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
     }
 }
 
+#define OBUF_SZ 16384
+
 static i64 worker_fn(void *arg) {
     Pool *p = (Pool *)arg;
     u8 rbuf[32768];
+    char obuf[OBUF_SZ];
+    i64 olen = 0;
 
     for (;;) {
         char *path; i64 len; u8 dtype;
@@ -97,20 +101,32 @@ static i64 worker_fn(void *arg) {
 
         if (match) {
             atomic_xadd(&p->matches, 1);
-            out_lock();
-            write_all(STDOUT_FILENO, path, len);
-            write_all(STDOUT_FILENO, "\n", 1);
-            out_unlock();
+
+            if (olen + len + 1 > OBUF_SZ) {
+                out_lock();
+                write_all(STDOUT_FILENO, obuf, olen);
+                out_unlock();
+                olen = 0;
+            }
+
+            for (i64 i = 0; i < len; i++) obuf[olen++] = path[i];
+            obuf[olen++] = '\n';
         }
 
         atomic_xadd(&p->pending, -1);
+    }
+
+    if (olen > 0) {
+        out_lock();
+        write_all(STDOUT_FILENO, obuf, olen);
+        out_unlock();
     }
 
     return 0;
 }
 
 static void spawn_worker(Pool *p) {
-    i64 stksz = 65536;
+    i64 stksz = 131072;
     void *stk = (void *)syscall6(SYS_mmap, 0, (unsigned long)stksz,
                                   PROT_READ|PROT_WRITE,
                                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
