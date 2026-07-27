@@ -23,6 +23,14 @@ static int  g_type_filter;  /* 0=any, 'f','d','l' */
 static i64 g_size_cmp;     /* -1=lt, 0=no filter, 1=gt */
 static i64 g_size_val;
 static i64 g_max_depth = -1;
+static i64 g_json;
+static i64 g_color = 1;
+
+static i64 is_tty(i64 fd) {
+    struct stat64 st;
+    if (syscall2(SYS_fstat, fd, (long)&st) < 0) return 0;
+    return (st.st_mode & S_IFMT) == S_IFCHR;
+}
 
 static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;30m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\033[0m\n");
@@ -59,8 +67,18 @@ static i64 size_filter_pass(i64 sz) {
 }
 
 static void print_hit(const char *path, i64 len) {
-    write_all(STDOUT_FILENO, path, len);
-    write_all(STDOUT_FILENO, "\n", 1);
+    if (g_json) {
+        write_str(STDOUT_FILENO, "{\"path\":\"");
+        for (i64 i = 0; i < len; i++) {
+            char c = path[i];
+            if (c == '"' || c == '\\') write_all(STDOUT_FILENO, "\\", 1);
+            write_all(STDOUT_FILENO, path + i, 1);
+        }
+        write_str(STDOUT_FILENO, "\"}\n");
+    } else {
+        write_all(STDOUT_FILENO, path, len);
+        write_all(STDOUT_FILENO, "\n", 1);
+    }
 }
 
 static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
@@ -203,6 +221,22 @@ int crom_main(int argc, char **argv) {
             g_use_ignore = 0;
             continue;
         }
+        if (str_eq(argv[i], "--json")) {
+            g_json = 1;
+            continue;
+        }
+        if (str_eq(argv[i], "--color")) {
+            if (i + 1 < argc) {
+                if (str_eq(argv[++i], "never")) g_color = 0;
+                else if (str_eq(argv[i], "always")) g_color = 2;
+                else g_color = 1;
+            }
+            continue;
+        }
+        if (str_eq(argv[i], "--no-color")) {
+            g_color = 0;
+            continue;
+        }
         if (argv[i][0] != '-') {
             if (argv[i][0] == '/' || argv[i][0] == '.' || argv[i][0] == '~') {
                 if (!target) target = argv[i];
@@ -223,6 +257,7 @@ int crom_main(int argc, char **argv) {
     if (needle) {
         pool = &pool_data;
         pool_init(pool, num_threads);
+        pool->json_out = g_json;
         pool_spawn(pool, needle, needle_len);
     }
 

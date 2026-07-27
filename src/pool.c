@@ -105,6 +105,36 @@ i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
 #define OBUF_SZ 16384
 #define BATCH_SZ 32
 
+static void buf_add(char *buf, i64 *olen, const char *p, i64 plen) {
+    for (i64 i = 0; i < plen; i++) buf[(*olen)++] = p[i];
+}
+
+static void buf_emit(Pool *p, const char *path, i64 len, char *obuf, i64 *olen) {
+    if (p->json_out) {
+        if (*olen + len + 16 > OBUF_SZ) {
+            out_lock();
+            write_all(STDOUT_FILENO, obuf, *olen);
+            out_unlock();
+            *olen = 0;
+        }
+        buf_add(obuf, olen, "{\"path\":\"", 9);
+        for (i64 i = 0; i < len; i++) {
+            if (path[i] == '"' || path[i] == '\\') obuf[(*olen)++] = '\\';
+            obuf[(*olen)++] = path[i];
+        }
+        buf_add(obuf, olen, "\"}\n", 3);
+    } else {
+        if (*olen + len + 1 > OBUF_SZ) {
+            out_lock();
+            write_all(STDOUT_FILENO, obuf, *olen);
+            out_unlock();
+            *olen = 0;
+        }
+        buf_add(obuf, olen, path, len);
+        obuf[(*olen)++] = '\n';
+    }
+}
+
 typedef struct {
     char *path;
     i64 len;
@@ -127,14 +157,7 @@ static i64 worker_fn(void *arg) {
                 match = search_file(path, g_needle, g_nlen, rbuf, sizeof(rbuf));
             if (match) {
                 atomic_xadd(&p->matches, 1);
-                if (olen + len + 1 > OBUF_SZ) {
-                    out_lock();
-                    write_all(STDOUT_FILENO, obuf, olen);
-                    out_unlock();
-                    olen = 0;
-                }
-                for (i64 i = 0; i < len; i++) obuf[olen++] = path[i];
-                obuf[olen++] = '\n';
+                buf_emit(p, path, len, obuf, &olen);
             }
             atomic_xadd(&p->pending, -1);
         }
@@ -213,14 +236,7 @@ static i64 worker_fn(void *arg) {
             if (match) {
                 atomic_xadd(&p->matches, 1);
                 BatchSlot *bs = &batch[idx];
-                if (olen + bs->len + 1 > OBUF_SZ) {
-                    out_lock();
-                    write_all(STDOUT_FILENO, obuf, olen);
-                    out_unlock();
-                    olen = 0;
-                }
-                for (i64 j = 0; j < bs->len; j++) obuf[olen++] = bs->path[j];
-                obuf[olen++] = '\n';
+                buf_emit(p, bs->path, bs->len, obuf, &olen);
             }
 
             atomic_xadd(&p->pending, -1);

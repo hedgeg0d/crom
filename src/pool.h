@@ -21,6 +21,7 @@ typedef struct {
     volatile i64 pending;
     volatile i64 matches;
     i64 num_workers;
+    i64 json_out;
 } Pool;
 
 void pool_init(Pool *p, i64 workers);
