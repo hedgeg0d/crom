@@ -85,6 +85,20 @@ static i64 parse_int(const char *s) {
     return v;
 }
 
+static i64 nproc(void) {
+    unsigned long mask[16];
+    long n = syscall3(SYS_sched_getaffinity, 0, sizeof(mask), (long)mask);
+    if (n <= 0) return 1;
+    i64 count = 0;
+    i64 words = n / (i64)sizeof(unsigned long);
+    if (words > 16) words = 16;
+    for (i64 i = 0; i < words; i++) {
+        unsigned long v = mask[i];
+        while (v) { count++; v &= v - 1; }
+    }
+    return count > 0 ? count : 1;
+}
+
 int crom_main(int argc, char **argv) {
     if (argv[0]) {
         const char *p = argv[0];
@@ -147,7 +161,7 @@ int crom_main(int argc, char **argv) {
 
     if (!target) target = ".";
     if (!pattern && !needle) pattern = "*";
-    if (num_threads <= 0) num_threads = 1;
+    if (num_threads <= 0) num_threads = nproc();
 
     if (g_bar) display_init();
     ignore_set_enabled(g_use_ignore);

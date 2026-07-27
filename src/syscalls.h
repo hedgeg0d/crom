@@ -35,6 +35,7 @@
 #define SYS_io_uring_enter   426
 #define SYS_io_uring_register 427
 #define SYS_openat2          437
+#define SYS_sched_getaffinity 204
 #define SYS_getrandom        318
 #define SYS_clock_gettime    228
 
