@@ -10,6 +10,7 @@
 #define SYS_mmap           9
 #define SYS_mremap        25
 #define SYS_munmap        11
+#define SYS_pread64       17
 #define SYS_brk           12
 #define SYS_nanosleep     35
 #define SYS_getpid        39
@@ -139,6 +140,20 @@ static inline long is_mmap_err(void *p) {
 
 #define CLOCK_MONOTONIC 1
 #define CLOCK_REALTIME  0
+
+struct stat64 {
+    unsigned long st_dev;
+    unsigned long st_ino;
+    unsigned long st_nlink;
+    unsigned int  st_mode;
+    unsigned int  st_uid;
+    unsigned int  st_gid;
+    unsigned int  __pad0;
+    unsigned long st_rdev;
+    long          st_size;
+    long          st_blksize;
+    long          st_blocks;
+};
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1

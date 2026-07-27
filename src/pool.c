@@ -24,24 +24,6 @@ static void out_unlock(void) {
              FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
 }
 
-static i64 search_file(const char *path) {
-    i64 fd = syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
-    if (fd < 0) return 0;
-
-    i64 size = syscall3(SYS_lseek, fd, 0, SEEK_END);
-    if (size <= 0) { syscall1(SYS_close, fd); return 0; }
-
-    void *data = (void *)syscall6(SYS_mmap, 0, (unsigned long)size,
-                                   PROT_READ, MAP_PRIVATE, fd, 0);
-    if (is_mmap_err(data)) { syscall1(SYS_close, fd); return 0; }
-
-    i64 found = content_search((const u8 *)data, size, g_needle, g_nlen);
-
-    syscall2(SYS_munmap, (long)data, (unsigned long)size);
-    syscall1(SYS_close, fd);
-    return found;
-}
-
 void pool_init(Pool *p, i64 workers) {
     p->head = 0;
     p->tail = 0;
@@ -103,13 +85,15 @@ i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
 
 static i64 worker_fn(void *arg) {
     Pool *p = (Pool *)arg;
+    u8 rbuf[32768];
 
     for (;;) {
         char *path; i64 len; u8 dtype;
         if (pop_item(p, &path, &len, &dtype) < 0) break;
 
         i64 match = 1;
-        if (g_needle) match = search_file(path);
+        if (g_needle)
+            match = search_file(path, g_needle, g_nlen, rbuf, sizeof(rbuf));
 
         if (match) {
             atomic_xadd(&p->matches, 1);
