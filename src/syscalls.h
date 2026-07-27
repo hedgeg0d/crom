@@ -16,8 +16,10 @@
 #define SYS_getpid        39
 #define SYS_clone         56
 #define SYS_fork          57
+#define SYS_vfork         58
 #define SYS_execve        59
 #define SYS_exit          60
+#define SYS_wait4         61
 #define SYS_fcntl         72
 #define SYS_fsync         74
 #define SYS_ftruncate     77

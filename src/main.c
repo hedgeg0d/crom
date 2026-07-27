@@ -25,6 +25,34 @@ static i64 g_size_val;
 static i64 g_max_depth = -1;
 static i64 g_json;
 static i64 g_color = 1;
+static const char *g_exec_cmd;
+static i64 g_exec_batch;
+
+static void exec_file(const char *path, i64 len) {
+    char buf[4096];
+    i64 pos = 0;
+    const char *c = g_exec_cmd;
+    while (*c) {
+        if (*c == '{' && c[1] == '}') {
+            for (i64 i = 0; i < len; i++) buf[pos++] = path[i];
+            c += 2;
+        } else {
+            buf[pos++] = *c++;
+        }
+    }
+    buf[pos] = 0;
+
+    i64 pid = syscall0(SYS_fork);
+    if (pid < 0) return;
+    if (pid == 0) {
+        const char *argv[] = {"/bin/sh", "-c", buf, 0};
+        const char *envp[] = {"PATH=/usr/bin:/bin:/usr/sbin", 0};
+        syscall3(SYS_execve, (long)"/bin/sh", (long)argv, (long)envp);
+        syscall1(SYS_exit, 1);
+    }
+    i32 status;
+    syscall4(SYS_wait4, pid, (long)&status, 0, 0);
+}
 
 static i64 is_tty(i64 fd) {
     struct stat64 st;
@@ -118,6 +146,10 @@ static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
 
     if (pool) {
         pool_push(pool, path, len, dtype);
+    } else if (g_exec_cmd) {
+        g_matches++;
+        if (g_bar && (g_matches & 15) == 0) display_update(g_dirs, g_files, g_matches);
+        exec_file(path, len);
     } else {
         g_matches++;
         if (g_bar && (g_matches & 15) == 0) display_update(g_dirs, g_files, g_matches);
@@ -235,6 +267,10 @@ int crom_main(int argc, char **argv) {
         }
         if (str_eq(argv[i], "--no-color")) {
             g_color = 0;
+            continue;
+        }
+        if (str_eq(argv[i], "-e") || str_eq(argv[i], "--exec")) {
+            if (i + 1 < argc) g_exec_cmd = argv[++i];
             continue;
         }
         if (argv[i][0] != '-') {
