@@ -26,6 +26,8 @@ typedef struct {
 void pool_init(Pool *p, i64 workers);
 void pool_spawn(Pool *p, const char *needle, i64 nlen);
 i64  pool_push(Pool *p, const char *path, i64 len, u8 dtype);
+i64  pool_pop(Pool *p, char **path, i64 *len, u8 *dtype);
+i64  pool_try_pop(Pool *p, char **path, i64 *len, u8 *dtype);
 void pool_flush(Pool *p);
 
 #endif

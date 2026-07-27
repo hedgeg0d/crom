@@ -3,6 +3,7 @@
 #include "syscalls.h"
 #include "util.h"
 #include "match_content.h"
+#include "iouring.h"
 
 static const char *g_needle;
 static i64 g_nlen;
@@ -33,7 +34,7 @@ void pool_init(Pool *p, i64 workers) {
     p->num_workers = workers > 0 ? workers : 1;
 }
 
-static i64 pop_item(Pool *p, char **path, i64 *len, u8 *dtype) {
+i64 pool_pop(Pool *p, char **path, i64 *len, u8 *dtype) {
     for (;;) {
         i64 t = atomic_load(&p->tail);
         i64 h = atomic_load(&p->head);
@@ -44,6 +45,24 @@ static i64 pop_item(Pool *p, char **path, i64 *len, u8 *dtype) {
                      FUTEX_WAIT|FUTEX_PRIVATE_FLAG, h, 0, 0, 0);
             continue;
         }
+
+        if (atomic_cas(&p->tail, t, t + 1) != t) continue;
+
+        PoolItem *it = &p->items[t & (POOL_QUEUE_CAP - 1)];
+        *path = it->path;
+        *len = it->len;
+        *dtype = it->dtype;
+        atomic_xadd(&p->pending, 1);
+        return 0;
+    }
+}
+
+i64 pool_try_pop(Pool *p, char **path, i64 *len, u8 *dtype) {
+    for (;;) {
+        i64 t = atomic_load(&p->tail);
+        i64 h = atomic_load(&p->head);
+
+        if (t >= h) return -1;
 
         if (atomic_cas(&p->tail, t, t + 1) != t) continue;
 
@@ -84,37 +103,131 @@ i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
 }
 
 #define OBUF_SZ 16384
+#define BATCH_SZ 32
+
+typedef struct {
+    char *path;
+    i64 len;
+    u64 idx;
+} BatchSlot;
 
 static i64 worker_fn(void *arg) {
     Pool *p = (Pool *)arg;
     u8 rbuf[32768];
     char obuf[OBUF_SZ];
     i64 olen = 0;
+    IOUring ring;
+
+    if (1 || iouring_init(&ring, 64) < 0) {
+        for (;;) {
+            char *path; i64 len; u8 dtype;
+            if (pool_pop(p, &path, &len, &dtype) < 0) break;
+            i64 match = 1;
+            if (g_needle)
+                match = search_file(path, g_needle, g_nlen, rbuf, sizeof(rbuf));
+            if (match) {
+                atomic_xadd(&p->matches, 1);
+                if (olen + len + 1 > OBUF_SZ) {
+                    out_lock();
+                    write_all(STDOUT_FILENO, obuf, olen);
+                    out_unlock();
+                    olen = 0;
+                }
+                for (i64 i = 0; i < len; i++) obuf[olen++] = path[i];
+                obuf[olen++] = '\n';
+            }
+            atomic_xadd(&p->pending, -1);
+        }
+        if (olen > 0) { out_lock(); write_all(STDOUT_FILENO, obuf, olen); out_unlock(); }
+        return 0;
+    }
+
+    BatchSlot batch[BATCH_SZ];
 
     for (;;) {
-        char *path; i64 len; u8 dtype;
-        if (pop_item(p, &path, &len, &dtype) < 0) break;
+        if (pool_pop(p, &batch[0].path, &batch[0].len, (u8 *)&batch[0].idx) < 0)
+            break;
+        batch[0].idx = 0;
+        i64 count = 1;
 
-        i64 match = 1;
-        if (g_needle)
-            match = search_file(path, g_needle, g_nlen, rbuf, sizeof(rbuf));
-
-        if (match) {
-            atomic_xadd(&p->matches, 1);
-
-            if (olen + len + 1 > OBUF_SZ) {
-                out_lock();
-                write_all(STDOUT_FILENO, obuf, olen);
-                out_unlock();
-                olen = 0;
-            }
-
-            for (i64 i = 0; i < len; i++) obuf[olen++] = path[i];
-            obuf[olen++] = '\n';
+        while (count < BATCH_SZ) {
+            u8 dtype;
+            if (pool_try_pop(p, &batch[count].path, &batch[count].len, &dtype) < 0)
+                break;
+            batch[count].idx = (u64)count;
+            count++;
         }
 
-        atomic_xadd(&p->pending, -1);
+        iouring_sync(&ring);
+
+        for (i64 i = 0; i < count; i++) {
+            struct iouring_sqe *sqe = iouring_get_sqe(&ring);
+            if (!sqe) break;
+            sqe->opcode = IORING_OP_OPENAT;
+            sqe->fd = AT_FDCWD;
+            sqe->addr = (u64)batch[i].path;
+            sqe->open_flags = O_RDONLY|O_CLOEXEC;
+            sqe->user_data = batch[i].idx;
+        }
+
+        iouring_submit(&ring);
+
+        for (i64 i = 0; i < count; i++) {
+            struct iouring_cqe *cqe;
+            while (!iouring_peek_cqe(&ring, &cqe))
+                syscall1(SYS_sched_yield, 0);
+
+            i32 fd = cqe->res;
+            u64 idx = cqe->user_data;
+            iouring_cqe_seen(&ring, cqe);
+
+            i64 match = 0;
+            if (fd >= 0) {
+                struct stat64 st;
+                if (syscall2(SYS_fstat, fd, (long)&st) >= 0) {
+                    i64 sz = st.st_size;
+                    if (sz >= g_nlen) {
+                        if ((u64)sz > (u64)sizeof(rbuf)) {
+                            void *data = (void *)syscall6(SYS_mmap, 0, (unsigned long)sz,
+                                                           PROT_READ, MAP_PRIVATE, fd, 0);
+                            if (!is_mmap_err(data)) {
+                                match = content_search((const u8 *)data, sz, g_needle, g_nlen);
+                                syscall2(SYS_munmap, (long)data, (unsigned long)sz);
+                            }
+                        } else {
+                            i64 total = 0;
+                            while (total < sz) {
+                                i64 n = syscall4(SYS_pread64, fd, (long)(rbuf + total),
+                                                  (unsigned long)(sz - total), total);
+                                if (n <= 0) break;
+                                total += n;
+                            }
+                            if (total == sz)
+                                match = content_search(rbuf, sz, g_needle, g_nlen);
+                        }
+                    }
+                }
+                syscall1(SYS_close, fd);
+            }
+
+            if (match) {
+                atomic_xadd(&p->matches, 1);
+                BatchSlot *bs = &batch[idx];
+                if (olen + bs->len + 1 > OBUF_SZ) {
+                    out_lock();
+                    write_all(STDOUT_FILENO, obuf, olen);
+                    out_unlock();
+                    olen = 0;
+                }
+                for (i64 j = 0; j < bs->len; j++) obuf[olen++] = bs->path[j];
+                obuf[olen++] = '\n';
+            }
+
+            atomic_xadd(&p->pending, -1);
+        }
     }
+
+    iouring_free(&ring);
 
     if (olen > 0) {
         out_lock();
