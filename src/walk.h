@@ -13,6 +13,6 @@ struct linux_dirent64 {
 
 typedef void (*walk_file_cb)(const char *path, i64 len, u8 d_type, void *ctx);
 
-void walk(const char *root, walk_file_cb cb, void *ctx);
+void walk(const char *root, walk_file_cb cb, void *ctx, i64 max_depth);
 
 #endif

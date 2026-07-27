@@ -12,6 +12,7 @@ static const char *DIRS[] = {
     ".idea",
     ".vscode",
     ".mypy_cache",
+    "build",
     0
 };
 

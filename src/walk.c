@@ -17,6 +17,8 @@ typedef struct {
     i64 len;
     walk_file_cb cb;
     void *ctx;
+    i64 max_depth;
+    i64 depth;
 } WalkState;
 
 static void walk_dir(WalkState *ws) {
@@ -46,7 +48,7 @@ static void walk_dir(WalkState *ws) {
                 if (name[1] == 0) goto skip;
                 if (name[1] == '.' && name[2] == 0) goto skip;
             }
-            if (d->d_type == DT_DIR && match_ignore(name, 1)) goto skip;
+            if (match_ignore(name, d->d_type == DT_DIR ? 1 : 0)) goto skip;
 
             i64 name_len = str_len(name);
             if (prefix_len + name_len >= PATH_SZ - 1) goto skip;
@@ -59,7 +61,10 @@ static void walk_dir(WalkState *ws) {
             ws->cb(ws->buf, ws->len, d->d_type, ws->ctx);
 
             if (d->d_type == DT_DIR) {
-                walk_dir(ws);
+                ws->depth++;
+                if (ws->max_depth < 0 || ws->depth <= ws->max_depth)
+                    walk_dir(ws);
+                ws->depth--;
             }
 
 skip:
@@ -73,11 +78,13 @@ skip:
     syscall1(SYS_close, fd);
 }
 
-void walk(const char *root, walk_file_cb cb, void *ctx) {
+void walk(const char *root, walk_file_cb cb, void *ctx, i64 max_depth) {
     WalkState ws;
     ws.len = 0;
     ws.cb = cb;
     ws.ctx = ctx;
+    ws.max_depth = max_depth;
+    ws.depth = 0;
 
     if (root && root[0]) {
         i64 rl = str_len(root);

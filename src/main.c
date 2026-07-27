@@ -19,6 +19,10 @@ static volatile i64 g_files;
 static volatile i64 g_matches;
 static i64 g_bar;
 static i64 g_use_ignore = 1;
+static int  g_type_filter;  /* 0=any, 'f','d','l' */
+static i64 g_size_cmp;     /* -1=lt, 0=no filter, 1=gt */
+static i64 g_size_val;
+static i64 g_max_depth = -1;
 
 static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;30m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\033[0m\n");
@@ -31,8 +35,7 @@ static void usage(void) {
     write_str(STDOUT_FILENO, "  \033[33m-n\033[0m, \033[33m--name\033[0m <glob>       Match filename pattern\n");
     write_str(STDOUT_FILENO, "  \033[33m-c\033[0m, \033[33m--content\033[0m <text>    Search file contents\n");
     write_str(STDOUT_FILENO, "  \033[33m-t\033[0m, \033[33m--type\033[0m <f|d|l>     Filter by type\n");
-    write_str(STDOUT_FILENO, "  \033[33m-s\033[0m, \033[33m--size\033[0m <N>         Filter by size (+/- prefix)\n");
-    write_str(STDOUT_FILENO, "  \033[33m--since\033[0m <N>[d|h|m]     Modified within range\n");
+    write_str(STDOUT_FILENO, "  \033[33m-s\033[0m, \033[33m--size\033[0m <[+-]N>     Filter by size\n");
     write_str(STDOUT_FILENO, "  \033[33m--depth\033[0m <N>           Max recursion depth\n");
     write_str(STDOUT_FILENO, "  \033[33m-e\033[0m, \033[33m--exec\033[0m <cmd> {}    Execute command per result\n");
     write_str(STDOUT_FILENO, "  \033[33m-j\033[0m, \033[33m--threads\033[0m <N>     Worker threads\n");
@@ -49,6 +52,17 @@ static void usage(void) {
     write_str(STDOUT_FILENO, "  crom '**/test*' --bar         Test files, with progress\n");
 }
 
+static i64 size_filter_pass(i64 sz) {
+    if (!g_size_cmp) return 1;
+    if (g_size_cmp > 0) return sz > g_size_val;
+    return sz < g_size_val;
+}
+
+static void print_hit(const char *path, i64 len) {
+    write_all(STDOUT_FILENO, path, len);
+    write_all(STDOUT_FILENO, "\n", 1);
+}
+
 static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
     (void)ctx;
 
@@ -61,7 +75,13 @@ static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
         return;
     }
 
-    if (dtype != DT_REG) return;
+    if (g_type_filter) {
+        if (g_type_filter == 'f' && dtype != DT_REG) return;
+        if (g_type_filter == 'd' && dtype != DT_DIR) return;
+        if (g_type_filter == 'l' && dtype != DT_LNK) return;
+    } else if (dtype != DT_REG) {
+        return;
+    }
 
     if (pattern) {
         const char *name = path + len;
@@ -69,19 +89,40 @@ static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
         if (!match_glob(pattern, name)) return;
     }
 
+    if (g_size_cmp) {
+        i32 fd = (i32)syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
+        if (fd < 0) return;
+        struct stat64 st;
+        i64 ok = syscall2(SYS_fstat, fd, (long)&st) >= 0 && size_filter_pass(st.st_size);
+        syscall1(SYS_close, fd);
+        if (!ok) return;
+    }
+
     if (pool) {
         pool_push(pool, path, len, dtype);
     } else {
         g_matches++;
         if (g_bar && (g_matches & 15) == 0) display_update(g_dirs, g_files, g_matches);
-        write_all(STDOUT_FILENO, path, len);
-        write_all(STDOUT_FILENO, "\n", 1);
+        print_hit(path, len);
     }
 }
 
 static i64 parse_int(const char *s) {
     i64 v = 0;
     for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
+    return v;
+}
+
+static i64 parse_size(const char *s) {
+    if (*s == '+' || *s == '-') {
+        g_size_cmp = (*s == '+') ? 1 : -1;
+        s++;
+    }
+    i64 v = 0;
+    for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
+    if (*s == 'k' || *s == 'K') { v *= 1024; s++; }
+    else if (*s == 'm' || *s == 'M') { v *= 1048576; s++; }
+    else if (*s == 'g' || *s == 'G') { v *= 1073741824; s++; }
     return v;
 }
 
@@ -142,6 +183,18 @@ int crom_main(int argc, char **argv) {
             if (i + 1 < argc) num_threads = parse_int(argv[++i]);
             continue;
         }
+        if (str_eq(argv[i], "-t") || str_eq(argv[i], "--type")) {
+            if (i + 1 < argc) g_type_filter = argv[++i][0];
+            continue;
+        }
+        if (str_eq(argv[i], "-s") || str_eq(argv[i], "--size")) {
+            if (i + 1 < argc) g_size_val = parse_size(argv[++i]);
+            continue;
+        }
+        if (str_eq(argv[i], "--depth")) {
+            if (i + 1 < argc) g_max_depth = parse_int(argv[++i]);
+            continue;
+        }
         if (str_eq(argv[i], "--bar")) {
             g_bar = 1;
             continue;
@@ -162,6 +215,7 @@ int crom_main(int argc, char **argv) {
     if (!target) target = ".";
     if (!pattern && !needle) pattern = "*";
     if (num_threads <= 0) num_threads = nproc();
+    if (g_size_cmp == 0 && g_size_val > 0) g_size_cmp = 1;
 
     if (g_bar) display_init();
     ignore_set_enabled(g_use_ignore);
@@ -172,7 +226,7 @@ int crom_main(int argc, char **argv) {
         pool_spawn(pool, needle, needle_len);
     }
 
-    walk(target, on_file, 0);
+    walk(target, on_file, 0, g_max_depth);
 
     if (pool) {
         pool_flush(pool);
