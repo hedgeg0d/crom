@@ -19,11 +19,17 @@ typedef struct {
     void *ctx;
     i64 max_depth;
     i64 depth;
+    GitList git;
 } WalkState;
 
 static void walk_dir(WalkState *ws) {
     i64 fd = open_dir(ws->buf);
     if (fd < 0) return;
+
+    GitList prev_git;
+    prev_git.count = ws->git.count;
+    prev_git.buf_len = ws->git.buf_len;
+    gitignore_load(&ws->git, ws->buf, ws->len);
 
     char dbuf[BUF_SZ];
     if (ws->len == 0) {
@@ -49,6 +55,7 @@ static void walk_dir(WalkState *ws) {
                 if (name[1] == '.' && name[2] == 0) goto skip;
             }
             if (match_ignore(name, d->d_type == DT_DIR ? 1 : 0)) goto skip;
+            if (gitignore_check(&ws->git, name, d->d_type == DT_DIR ? 1 : 0)) goto skip;
 
             i64 name_len = str_len(name);
             if (prefix_len + name_len >= PATH_SZ - 1) goto skip;
@@ -74,6 +81,8 @@ skip:
 
     ws->buf[prefix_len] = 0;
     ws->len = prefix_len;
+    ws->git.count = prev_git.count;
+    ws->git.buf_len = prev_git.buf_len;
 
     syscall1(SYS_close, fd);
 }
@@ -85,6 +94,8 @@ void walk(const char *root, walk_file_cb cb, void *ctx, i64 max_depth) {
     ws.ctx = ctx;
     ws.max_depth = max_depth;
     ws.depth = 0;
+    ws.git.count = 0;
+    ws.git.buf_len = 0;
 
     if (root && root[0]) {
         i64 rl = str_len(root);
