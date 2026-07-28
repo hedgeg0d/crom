@@ -55,6 +55,7 @@ static void usage(void) {
     write_str_c(STDOUT_FILENO, "  \033[33m-0\033[0m, \033[33m--null\033[0m          null-separated output\n", c);
     write_str_c(STDOUT_FILENO, "  \033[33m--json\033[0m             JSON output\n", c);
     write_str_c(STDOUT_FILENO, "  \033[33m--bar\033[0m              progress bar\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-q\033[0m, \033[33m--no-bar\033[0m        quiet, no progress bar\n", c);
     write_str_c(STDOUT_FILENO, "  \033[33m--no-ignore\033[0m         skip .gitignore\n", c);
     write_str_c(STDOUT_FILENO, "  \033[33m--no-config\033[0m         skip config file\n", c);
     write_str_c(STDOUT_FILENO, "  \033[33m--color\033[0m <when>      auto|always|never\n", c);
@@ -180,6 +181,7 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
         if (i + 1 < ac) g_max_depth = parse_int(av[++i]); *pi = i; return;
     }
     if (str_eq(arg, "--bar")) { g_bar = 1; *pi = i; return; }
+    if (str_eq(arg, "--no-bar") || str_eq(arg, "-q")) { g_bar = 0; *pi = i; return; }
     if (str_eq(arg, "-a") || str_eq(arg, "--text")) { g_binary = 1; *pi = i; return; }
     if (str_eq(arg, "-0") || str_eq(arg, "--null")) { g_null_sep = 1; *pi = i; return; }
     if (str_eq(arg, "--no-ignore")) { g_use_ignore = 0; *pi = i; return; }
