@@ -27,6 +27,9 @@ static i64 g_color = 1;
 static i64 g_binary;
 static const char *g_exec_cmd;
 
+static const char *target;
+static i32 saw_dash;
+
 static void usage(void) {
     write_str(STDOUT_FILENO, "\033[1;36mcrom\033[0m — fast file hunter\n\n");
     write_str(STDOUT_FILENO, "  \033[1mcrom\033[0m [pattern] [path]\n\n");
@@ -42,6 +45,7 @@ static void usage(void) {
     write_str(STDOUT_FILENO, "  \033[33m--json\033[0m             JSON output\n");
     write_str(STDOUT_FILENO, "  \033[33m--bar\033[0m              progress bar\n");
     write_str(STDOUT_FILENO, "  \033[33m--no-ignore\033[0m         skip .gitignore\n");
+    write_str(STDOUT_FILENO, "  \033[33m--no-config\033[0m         skip config file\n");
     write_str(STDOUT_FILENO, "  \033[33m--color\033[0m auto|never\n");
     write_str(STDOUT_FILENO, "  \033[33m-h\033[0m, \033[33m--help\033[0m          show help\n");
     write_str(STDOUT_FILENO, "  \033[33m-V\033[0m, \033[33m--version\033[0m       print version\n");
@@ -54,10 +58,7 @@ static i64 parse_int(const char *s) {
 }
 
 static i64 parse_size(const char *s) {
-    if (*s == '+' || *s == '-') {
-        g_size_cmp = (*s == '+') ? 1 : -1;
-        s++;
-    }
+    if (*s == '+' || *s == '-') { g_size_cmp = (*s == '+') ? 1 : -1; s++; }
     i64 v = 0;
     for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
     if (*s == 'k' || *s == 'K') v *= 1024;
@@ -80,77 +81,143 @@ static i64 nproc(void) {
     return count > 0 ? count : 1;
 }
 
-int crom_main(int argc, char **argv) {
+static char *getenv_c(const char *name, char **envp) {
+    i64 nl = str_len(name);
+    while (*envp) {
+        const char *e = *envp;
+        i64 i;
+        for (i = 0; i < nl && e[i] == name[i]; i++);
+        if (i == nl && e[nl] == '=') return (char *)(e + nl + 1);
+        envp++;
+    }
+    return 0;
+}
+
+#define CFG_BUF_SZ 2048
+static char cfg_buf[CFG_BUF_SZ];
+static char *cfg_argv[128];
+static i64 cfg_argc;
+
+static i64 load_config(char **envp) {
+    char *home = getenv_c("HOME", envp);
+    if (!home) return 0;
+
+    char path[1024];
+    i64 pl = 0, hl = str_len(home);
+    for (i64 i = 0; i < hl; i++) path[pl++] = home[i];
+    path[pl++] = '/'; path[pl++] = '.'; path[pl++] = 'c';
+    path[pl++] = 'r'; path[pl++] = 'o'; path[pl++] = 'm';
+    path[pl++] = 'r'; path[pl++] = 'c';
+    path[pl] = 0;
+
+    i32 fd = (i32)syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
+    if (fd < 0) return 0;
+
+    i64 n = syscall3(SYS_read, fd, (long)cfg_buf, CFG_BUF_SZ - 1);
+    syscall1(SYS_close, fd);
+    if (n <= 0) return 0;
+    cfg_buf[n] = 0;
+
+    cfg_argc = 0;
+    char *p = cfg_buf;
+    while (*p && cfg_argc < 127) {
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (*p == '#' || *p == 0) { while (*p && *p != '\n') p++; continue; }
+        cfg_argv[cfg_argc++] = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+        if (*p) { *p = 0; p++; }
+    }
+    cfg_argv[cfg_argc] = 0;
+    return cfg_argc;
+}
+
+static void parse_arg(const char *arg, int ac, char **av, int *pi) {
+    int i = *pi;
+
+    if (!saw_dash && str_eq(arg, "--")) { saw_dash = 1; *pi = i; return; }
+    if (saw_dash) {
+        if (!pattern) pattern = arg;
+        else if (!target) target = arg;
+        *pi = i; return;
+    }
+
+    if (str_eq(arg, "-h") || str_eq(arg, "--help")) { usage(); *pi = i; return; }
+    if (str_eq(arg, "-V") || str_eq(arg, "--version")) {
+        write_str(STDOUT_FILENO, "crom 0.2.0\n"); *pi = i; return;
+    }
+    if (str_eq(arg, "-n") || str_eq(arg, "--name")) {
+        if (i + 1 < ac) pattern = av[++i]; *pi = i; return;
+    }
+    if (str_eq(arg, "-c") || str_eq(arg, "--content")) {
+        if (i + 1 < ac) { needle = av[++i]; needle_len = str_len(needle); }
+        *pi = i; return;
+    }
+    if (str_eq(arg, "-j") || str_eq(arg, "--threads")) {
+        if (i + 1 < ac) num_threads = parse_int(av[++i]); *pi = i; return;
+    }
+    if (arg[0] == '-' && arg[1] == 'j' && arg[2]) {
+        num_threads = parse_int(arg + 2); *pi = i; return;
+    }
+    if (str_eq(arg, "-t") || str_eq(arg, "--type")) {
+        if (i + 1 < ac) g_type_filter = av[++i][0]; *pi = i; return;
+    }
+    if (str_eq(arg, "-s") || str_eq(arg, "--size")) {
+        if (i + 1 < ac) g_size_val = parse_size(av[++i]); *pi = i; return;
+    }
+    if (str_eq(arg, "--depth")) {
+        if (i + 1 < ac) g_max_depth = parse_int(av[++i]); *pi = i; return;
+    }
+    if (str_eq(arg, "--bar")) { g_bar = 1; *pi = i; return; }
+    if (str_eq(arg, "-a") || str_eq(arg, "--text")) { g_binary = 1; *pi = i; return; }
+    if (str_eq(arg, "-0") || str_eq(arg, "--null")) { g_null_sep = 1; *pi = i; return; }
+    if (str_eq(arg, "--no-ignore")) { g_use_ignore = 0; *pi = i; return; }
+    if (str_eq(arg, "--no-config")) { *pi = i; return; }
+    if (str_eq(arg, "--json")) { g_json = 1; *pi = i; return; }
+    if (str_eq(arg, "--no-color")) { g_color = 0; *pi = i; return; }
+    if (str_eq(arg, "--color")) {
+        if (i + 1 < ac) {
+            if (str_eq(av[++i], "never")) g_color = 0;
+            else if (str_eq(av[i], "always")) g_color = 2;
+            else g_color = 1;
+        }
+        *pi = i; return;
+    }
+    if (str_eq(arg, "-e") || str_eq(arg, "--exec")) {
+        if (i + 1 < ac) g_exec_cmd = av[++i]; *pi = i; return;
+    }
+    if (arg[0] != '-') {
+        if (arg[0] == '/' || arg[0] == '.' || arg[0] == '~') {
+            if (!target) target = arg;
+        } else {
+            if (!pattern) pattern = arg;
+        }
+    }
+    *pi = i;
+}
+
+int crom_main(int argc, char **argv, char **envp) {
     if (argv[0]) {
         const char *p = argv[0];
         i64 plen = str_len(p);
-        for (i64 i = plen - 1; i >= 0 && p[i] != '/'; i--) {
+        for (i64 i = plen - 1; i >= 0 && p[i] != '/'; i--)
             if (i == 0 || p[i-1] == '/') { prog = p + i; break; }
-        }
     }
 
-    const char *target = 0;
-    i32 saw_dash = 0;
+    i32 no_cfg = 0;
+    for (int i = 1; i < argc; i++)
+        if (str_eq(argv[i], "--no-config")) no_cfg = 1;
 
-    for (int i = 1; i < argc; i++) {
-        if (!saw_dash && str_eq(argv[i], "--")) { saw_dash = 1; continue; }
-        if (saw_dash) {
-            if (!pattern) pattern = argv[i];
-            else if (!target) target = argv[i];
-            continue;
-        }
+    target = 0;
+    saw_dash = 0;
 
-        if (str_eq(argv[i], "-h") || str_eq(argv[i], "--help")) { usage(); return 0; }
-        if (str_eq(argv[i], "-V") || str_eq(argv[i], "--version")) {
-            write_str(STDOUT_FILENO, "crom 0.2.0\n"); return 0;
-        }
-        if (str_eq(argv[i], "-n") || str_eq(argv[i], "--name")) {
-            if (i + 1 < argc) pattern = argv[++i]; continue;
-        }
-        if (str_eq(argv[i], "-c") || str_eq(argv[i], "--content")) {
-            if (i + 1 < argc) { needle = argv[++i]; needle_len = str_len(needle); }
-            continue;
-        }
-        if (str_eq(argv[i], "-j") || str_eq(argv[i], "--threads")) {
-            if (i + 1 < argc) num_threads = parse_int(argv[++i]); continue;
-        }
-        if (argv[i][0] == '-' && argv[i][1] == 'j' && argv[i][2]) {
-            num_threads = parse_int(argv[i] + 2); continue;
-        }
-        if (str_eq(argv[i], "-t") || str_eq(argv[i], "--type")) {
-            if (i + 1 < argc) g_type_filter = argv[++i][0]; continue;
-        }
-        if (str_eq(argv[i], "-s") || str_eq(argv[i], "--size")) {
-            if (i + 1 < argc) g_size_val = parse_size(argv[++i]); continue;
-        }
-        if (str_eq(argv[i], "--depth")) {
-            if (i + 1 < argc) g_max_depth = parse_int(argv[++i]); continue;
-        }
-        if (str_eq(argv[i], "--bar")) { g_bar = 1; continue; }
-        if (str_eq(argv[i], "-a") || str_eq(argv[i], "--text")) { g_binary = 1; continue; }
-        if (str_eq(argv[i], "-0") || str_eq(argv[i], "--null")) { g_null_sep = 1; continue; }
-        if (str_eq(argv[i], "--no-ignore")) { g_use_ignore = 0; continue; }
-        if (str_eq(argv[i], "--json")) { g_json = 1; continue; }
-        if (str_eq(argv[i], "--no-color")) { g_color = 0; continue; }
-        if (str_eq(argv[i], "--color")) {
-            if (i + 1 < argc) {
-                if (str_eq(argv[++i], "never")) g_color = 0;
-                else if (str_eq(argv[i], "always")) g_color = 2;
-                else g_color = 1;
-            }
-            continue;
-        }
-        if (str_eq(argv[i], "-e") || str_eq(argv[i], "--exec")) {
-            if (i + 1 < argc) g_exec_cmd = argv[++i]; continue;
-        }
-        if (argv[i][0] != '-') {
-            if (argv[i][0] == '/' || argv[i][0] == '.' || argv[i][0] == '~') {
-                if (!target) target = argv[i];
-            } else {
-                if (!pattern) pattern = argv[i];
-            }
-        }
+    if (!no_cfg) {
+        i64 ca = load_config(envp);
+        if (ca > 0)
+            for (int i = 0; i < (int)ca; i++) parse_arg(cfg_argv[i], (int)ca, cfg_argv, &i);
     }
+
+    for (int i = 1; i < argc; i++)
+        parse_arg(argv[i], argc, argv, &i);
 
     if (!target) target = ".";
     if (!pattern && !needle) pattern = "*";
