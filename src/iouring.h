@@ -12,10 +12,20 @@
 
 #define IORING_OP_OPENAT    18
 #define IORING_OP_CLOSE     19
-#define IORING_OP_OPENAT2   37
+#define IORING_OP_STATX     21
+#define IORING_OP_READ      22
+#define IORING_OP_OPENAT2   28
 
 #define IOSQE_FIXED_FILE    (1U << 0)
+#define IOSQE_IO_LINK       (1U << 2)
+#define IOSQE_IO_HARDLINK   (1U << 3)
 
+#define IORING_REGISTER_FILES 2
+
+/* Tail of the SQE past user_data. file_index is what turns OPENAT into a
+   direct-descriptor open (slot+1), which is the only way a linked READ can
+   address the fd the OPENAT produced -- io_uring does not propagate plain
+   fds between links. */
 struct iouring_sqe {
     u8  opcode;
     u8  flags;
@@ -26,7 +36,11 @@ struct iouring_sqe {
     u32 len;
     u32 open_flags;
     u64 user_data;
-    u8  __pad[24];
+    u16 buf_index;
+    u16 personality;
+    u32 file_index;
+    u64 addr3;
+    u64 __pad2;
 };
 
 struct iouring_cqe {
@@ -89,10 +103,11 @@ typedef struct {
 } IOUring;
 
 i32 iouring_init(IOUring *r, u32 entries);
+i32 iouring_register_sparse_files(IOUring *r, u32 nr);
 void iouring_free(IOUring *r);
-void iouring_sync(IOUring *r);
+u32 iouring_sq_space(IOUring *r);
 struct iouring_sqe *iouring_get_sqe(IOUring *r);
-void iouring_submit(IOUring *r);
+i32 iouring_submit_and_wait(IOUring *r, u32 wait_nr);
 i32 iouring_wait(IOUring *r, u32 nr);
 i32 iouring_peek_cqe(IOUring *r, struct iouring_cqe **cqe);
 void iouring_cqe_seen(IOUring *r, struct iouring_cqe *cqe);

@@ -31,33 +31,56 @@ void pool_init(Pool *p, i64 workers) {
     p->done = 0;
     p->pending = 0;
     p->matches = 0;
+    p->workers_live = 0;
+    p->workers_exited = 0;
     p->num_workers = workers > 0 ? workers : 1;
+
+    for (i64 i = 0; i < POOL_QUEUE_CAP; i++) p->items[i].seq = i;
 }
 
-i64 pool_pop(Pool *p, char **path, i64 *len, u8 *dtype) {
+/* Claimed slot t -> copy payload out, then hand the slot back to the
+   producer. Must run before returning, since the producer is free to refill
+   the slot the moment seq is bumped. */
+static void slot_take(Pool *p, i64 t, char *path, i64 *len, u8 *dtype) {
+    PoolItem *it = &p->items[t & (POOL_QUEUE_CAP - 1)];
+
+    while (atomic_load(&it->seq) != t + 1) syscall1(SYS_sched_yield, 0);
+
+    i64 n = it->len;
+    for (i64 i = 0; i < n; i++) path[i] = it->path[i];
+    path[n] = 0;
+    *len = n;
+    *dtype = it->dtype;
+
+    atomic_store(&it->seq, t + POOL_QUEUE_CAP);
+}
+
+i64 pool_pop(Pool *p, char *path, i64 *len, u8 *dtype) {
     for (;;) {
         i64 t = atomic_load(&p->tail);
         i64 h = atomic_load(&p->head);
 
         if (t >= h) {
             if (atomic_load(&p->done)) return -1;
-            syscall6(SYS_futex, (long)&p->head,
-                     FUTEX_WAIT|FUTEX_PRIVATE_FLAG, h, 0, 0, 0);
+            atomic_xadd(&p->waiters, 1);
+            /* Re-check after registering: done/head may have changed between
+               the checks above and the sleep, and that wake would be lost. */
+            if (!atomic_load(&p->done) && atomic_load(&p->head) == h)
+                syscall6(SYS_futex, (long)&p->head,
+                         FUTEX_WAIT|FUTEX_PRIVATE_FLAG, h, 0, 0, 0);
+            atomic_xadd(&p->waiters, -1);
             continue;
         }
 
         if (atomic_cas(&p->tail, t, t + 1) != t) continue;
 
-        PoolItem *it = &p->items[t & (POOL_QUEUE_CAP - 1)];
-        *path = it->path;
-        *len = it->len;
-        *dtype = it->dtype;
         atomic_xadd(&p->pending, 1);
+        slot_take(p, t, path, len, dtype);
         return 0;
     }
 }
 
-i64 pool_try_pop(Pool *p, char **path, i64 *len, u8 *dtype) {
+i64 pool_try_pop(Pool *p, char *path, i64 *len, u8 *dtype) {
     for (;;) {
         i64 t = atomic_load(&p->tail);
         i64 h = atomic_load(&p->head);
@@ -66,11 +89,8 @@ i64 pool_try_pop(Pool *p, char **path, i64 *len, u8 *dtype) {
 
         if (atomic_cas(&p->tail, t, t + 1) != t) continue;
 
-        PoolItem *it = &p->items[t & (POOL_QUEUE_CAP - 1)];
-        *path = it->path;
-        *len = it->len;
-        *dtype = it->dtype;
         atomic_xadd(&p->pending, 1);
+        slot_take(p, t, path, len, dtype);
         return 0;
     }
 }
@@ -78,28 +98,24 @@ i64 pool_try_pop(Pool *p, char **path, i64 *len, u8 *dtype) {
 i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
     if (len >= POOL_PATH_SZ) return -1;
 
-    for (;;) {
-        i64 h = atomic_load(&p->head);
-        i64 t = atomic_load(&p->tail);
-        if (h - t >= POOL_QUEUE_CAP) {
-            syscall1(SYS_sched_yield, 0);
-            continue;
-        }
+    i64 h = atomic_load(&p->head);
+    PoolItem *it = &p->items[h & (POOL_QUEUE_CAP - 1)];
 
-        PoolItem *it = &p->items[h & (POOL_QUEUE_CAP - 1)];
-        for (i64 i = 0; i < len; i++) it->path[i] = path[i];
-        it->path[len] = 0;
-        it->len = len;
-        it->dtype = dtype;
+    /* Free only once the previous occupant's consumer has copied out. */
+    while (atomic_load(&it->seq) != h) syscall1(SYS_sched_yield, 0);
 
-        atomic_store(&p->head, h + 1);
+    for (i64 i = 0; i < len; i++) it->path[i] = path[i];
+    it->path[len] = 0;
+    it->len = len;
+    it->dtype = dtype;
 
-        if (h == t) {
-            syscall6(SYS_futex, (long)&p->head,
-                     FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
-        }
-        return 0;
-    }
+    atomic_store(&it->seq, h + 1);
+    atomic_store(&p->head, h + 1);
+
+    if (atomic_load(&p->waiters) > 0)
+        syscall6(SYS_futex, (long)&p->head,
+                 FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    return 0;
 }
 
 #define OBUF_SZ 16384
@@ -136,22 +152,53 @@ static void buf_emit(Pool *p, const char *path, i64 len, char *obuf, i64 *olen) 
 }
 
 typedef struct {
-    char *path;
+    char path[POOL_PATH_SZ];
     i64 len;
-    u64 idx;
 } BatchSlot;
+
+/* Each file is one chain of three linked SQEs. user_data carries the batch
+   index and which link it came from, since every SQE posts its own CQE. */
+#define UD_MAKE(i, kind) (((u64)(i) << 2) | (u64)(kind))
+#define UD_IDX(ud)       ((i64)((ud) >> 2))
+#define UD_KIND(ud)      ((u32)((ud) & 3))
+#define UD_OPEN  0
+#define UD_READ  1
+#define UD_CLOSE 2
+
+#define RBUF_SZ  32768
+#define SQE_PER_FILE 3
+/* Out of band for a read result, which is either a byte count or -errno.
+   -1 cannot be used: that is a legitimate -EPERM from the open. */
+#define RRES_SYNC 0x7fffffff
 
 static i64 worker_fn(void *arg) {
     Pool *p = (Pool *)arg;
-    u8 rbuf[32768];
     char obuf[OBUF_SZ];
     i64 olen = 0;
     IOUring ring;
+    i64 use_ring = 0;
+    u8 *rbufs = 0;
 
-    if (1 || iouring_init(&ring, 64) < 0) {
+#ifndef CROM_NO_URING
+    /* Ring must hold a whole batch of chains, plus a registered file table
+       with one direct-descriptor slot per in-flight file. */
+    if (iouring_init(&ring, BATCH_SZ * SQE_PER_FILE) == 0) {
+        if (iouring_register_sparse_files(&ring, BATCH_SZ) == 0) {
+            rbufs = (u8 *)syscall6(SYS_mmap, 0, BATCH_SZ * RBUF_SZ,
+                                   PROT_READ|PROT_WRITE,
+                                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            if (is_mmap_err(rbufs)) rbufs = 0;
+            else use_ring = 1;
+        }
+        if (!use_ring) iouring_free(&ring);
+    }
+#endif
+
+    if (!use_ring) {
+        u8 rbuf[RBUF_SZ];
         for (;;) {
-            char *path; i64 len; u8 dtype;
-            if (pool_pop(p, &path, &len, &dtype) < 0) break;
+            char path[POOL_PATH_SZ]; i64 len; u8 dtype;
+            if (pool_pop(p, path, &len, &dtype) < 0) break;
             i64 match = 1;
             if (g_needle)
                 match = search_file(path, g_needle, g_nlen, rbuf, sizeof(rbuf));
@@ -161,105 +208,140 @@ static i64 worker_fn(void *arg) {
             }
             atomic_xadd(&p->pending, -1);
         }
-        if (olen > 0) { out_lock(); write_all(STDOUT_FILENO, obuf, olen); out_unlock(); }
-        return 0;
+        goto done;
     }
 
+    {
     BatchSlot batch[BATCH_SZ];
+    i32 rres[BATCH_SZ];
 
     for (;;) {
-        if (pool_pop(p, &batch[0].path, &batch[0].len, (u8 *)&batch[0].idx) < 0)
+        u8 dtype;
+        if (pool_pop(p, batch[0].path, &batch[0].len, &dtype) < 0)
             break;
-        batch[0].idx = 0;
         i64 count = 1;
 
         while (count < BATCH_SZ) {
-            u8 dtype;
-            if (pool_try_pop(p, &batch[count].path, &batch[count].len, &dtype) < 0)
+            if (pool_try_pop(p, batch[count].path, &batch[count].len, &dtype) < 0)
                 break;
-            batch[count].idx = (u64)count;
             count++;
         }
 
-        iouring_sync(&ring);
+        for (i64 i = 0; i < count; i++) rres[i] = RRES_SYNC;
 
+        i64 staged = 0;
         for (i64 i = 0; i < count; i++) {
-            struct iouring_sqe *sqe = iouring_get_sqe(&ring);
-            if (!sqe) break;
-            sqe->opcode = IORING_OP_OPENAT;
-            sqe->fd = AT_FDCWD;
-            sqe->addr = (u64)batch[i].path;
-            sqe->open_flags = O_RDONLY|O_CLOEXEC;
-            sqe->user_data = batch[i].idx;
+            if (iouring_sq_space(&ring) < SQE_PER_FILE) break;
+
+            /* OPENAT into direct-descriptor slot i (file_index is slot+1).
+               IO_LINK: if the open fails, the read and close are cancelled. */
+            struct iouring_sqe *o = iouring_get_sqe(&ring);
+            o->opcode = IORING_OP_OPENAT;
+            o->flags = IOSQE_IO_LINK;
+            o->fd = AT_FDCWD;
+            o->addr = (u64)batch[i].path;
+            /* io_openat_prep rejects O_CLOEXEC together with file_index:
+               a direct descriptor never lands in the fd table. */
+            o->open_flags = O_RDONLY;
+            o->file_index = (u32)i + 1;
+            o->user_data = UD_MAKE(i, UD_OPEN);
+
+            /* READ addresses that slot via FIXED_FILE. HARDLINK so the close
+               still runs even when the read errors (e.g. EISDIR). */
+            struct iouring_sqe *rd = iouring_get_sqe(&ring);
+            rd->opcode = IORING_OP_READ;
+            rd->flags = IOSQE_FIXED_FILE|IOSQE_IO_HARDLINK;
+            rd->fd = (i32)i;
+            rd->addr = (u64)(rbufs + i * RBUF_SZ);
+            rd->len = RBUF_SZ;
+            rd->off = 0;
+            rd->user_data = UD_MAKE(i, UD_READ);
+
+            /* Direct close: fd must be 0 and the slot goes in file_index.
+               FIXED_FILE is rejected by close_prep, so flags stay clear. */
+            struct iouring_sqe *c = iouring_get_sqe(&ring);
+            c->opcode = IORING_OP_CLOSE;
+            c->fd = 0;
+            c->file_index = (u32)i + 1;
+            c->user_data = UD_MAKE(i, UD_CLOSE);
+
+            staged++;
         }
 
-        iouring_submit(&ring);
+        u32 nsqe = (u32)(staged * SQE_PER_FILE);
+        i32 got = nsqe ? iouring_submit_and_wait(&ring, nsqe) : 0;
 
-        for (i64 i = 0; i < count; i++) {
+        /* Drain whatever the ring produced; one CQE per SQE, chains included. */
+        for (i32 n = 0; n < got; n++) {
             struct iouring_cqe *cqe;
-            while (!iouring_peek_cqe(&ring, &cqe))
-                syscall1(SYS_sched_yield, 0);
-
-            i32 fd = cqe->res;
-            u64 idx = cqe->user_data;
+            if (!iouring_peek_cqe(&ring, &cqe)) {
+                if (iouring_wait(&ring, 1) < 0) break;
+                if (!iouring_peek_cqe(&ring, &cqe)) break;
+            }
+            i32 res = cqe->res;
+            u64 ud = cqe->user_data;
             iouring_cqe_seen(&ring, cqe);
 
+            i64 idx = UD_IDX(ud);
+            if (UD_KIND(ud) == UD_READ && idx >= 0 && idx < count)
+                rres[idx] = res;
+        }
+
+        /* A partial submit could split a chain, so treat it as "all sync". */
+        if (got != (i32)nsqe)
+            for (i64 i = 0; i < count; i++) rres[i] = RRES_SYNC;
+
+        for (i64 i = 0; i < count; i++) {
             i64 match = 0;
-            if (fd >= 0) {
-                struct stat64 st;
-                if (syscall2(SYS_fstat, fd, (long)&st) >= 0) {
-                    i64 sz = st.st_size;
-                    if (sz >= g_nlen) {
-                        if ((u64)sz > (u64)sizeof(rbuf)) {
-                            void *data = (void *)syscall6(SYS_mmap, 0, (unsigned long)sz,
-                                                           PROT_READ, MAP_PRIVATE, fd, 0);
-                            if (!is_mmap_err(data)) {
-                                match = content_search((const u8 *)data, sz, g_needle, g_nlen);
-                                syscall2(SYS_munmap, (long)data, (unsigned long)sz);
-                            }
-                        } else {
-                            i64 total = 0;
-                            while (total < sz) {
-                                i64 n = syscall4(SYS_pread64, fd, (long)(rbuf + total),
-                                                  (unsigned long)(sz - total), total);
-                                if (n <= 0) break;
-                                total += n;
-                            }
-                            if (total == sz)
-                                match = content_search(rbuf, sz, g_needle, g_nlen);
-                        }
-                    }
-                }
-                syscall1(SYS_close, fd);
+            i32 n = rres[i];
+
+            if (n >= 0 && n < RBUF_SZ) {
+                /* Whole file is in the buffer: a short read on a regular file
+                   only happens at EOF. */
+                match = content_search(rbufs + i * RBUF_SZ, n, g_needle, g_nlen);
+            } else if (n == RBUF_SZ || n == RRES_SYNC) {
+                /* Buffer filled means the file may be longer than RBUF_SZ;
+                   RRES_SYNC means it never went through the ring. Both need
+                   the synchronous path, which mmaps anything oversized. */
+                u8 *scratch = rbufs + i * RBUF_SZ;
+                match = search_file(batch[i].path, g_needle, g_nlen,
+                                    scratch, RBUF_SZ);
             }
+            /* Anything else is a real -errno from open/read: not a match. */
 
             if (match) {
                 atomic_xadd(&p->matches, 1);
-                BatchSlot *bs = &batch[idx];
-                buf_emit(p, bs->path, bs->len, obuf, &olen);
+                buf_emit(p, batch[i].path, batch[i].len, obuf, &olen);
             }
-
             atomic_xadd(&p->pending, -1);
         }
     }
+    }
 
+    syscall2(SYS_munmap, (long)rbufs, BATCH_SZ * RBUF_SZ);
     iouring_free(&ring);
 
+done:
     if (olen > 0) {
         out_lock();
         write_all(STDOUT_FILENO, obuf, olen);
         out_unlock();
     }
 
+    /* Publish the flush before pool_flush() is allowed to let main exit. */
+    atomic_xadd(&p->workers_exited, 1);
+    syscall6(SYS_futex, (long)&p->workers_exited,
+             FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
     return 0;
 }
 
-static void spawn_worker(Pool *p) {
-    i64 stksz = 131072;
+static i64 spawn_worker(Pool *p) {
+    /* worker_fn's frame is large: rbuf 32K + obuf 16K + batch 33K. */
+    i64 stksz = 1048576;
     void *stk = (void *)syscall6(SYS_mmap, 0, (unsigned long)stksz,
                                   PROT_READ|PROT_WRITE,
                                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (is_mmap_err(stk)) return;
+    if (is_mmap_err(stk)) return -1;
 
     u64 sp = (u64)stk + stksz;
     sp &= ~15ULL;
@@ -292,7 +374,9 @@ static void spawn_worker(Pool *p) {
 
     if (tid < 0) {
         syscall2(SYS_munmap, (long)stk, (unsigned long)stksz);
+        return -1;
     }
+    return 0;
 }
 
 void pool_spawn(Pool *p, const char *needle, i64 nlen) {
@@ -301,20 +385,25 @@ void pool_spawn(Pool *p, const char *needle, i64 nlen) {
     g_out_lock = 0;
 
     for (i64 i = 0; i < p->num_workers; i++) {
-        spawn_worker(p);
+        if (spawn_worker(p) == 0) atomic_xadd(&p->workers_live, 1);
     }
 }
 
 void pool_flush(Pool *p) {
     atomic_store(&p->done, 1);
-    syscall6(SYS_futex, (long)&p->head,
-             FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
 
+    /* Wait for every worker to drain its private output buffer and exit.
+       Waiting on pending==0 alone is not enough: a worker decrements pending
+       while the matching path is still sitting in its 16K obuf, and returning
+       here lets main exit_group() and kill it before the flush. */
+    i64 live = atomic_load(&p->workers_live);
     for (;;) {
-        i64 h = atomic_load(&p->head);
-        i64 t = atomic_load(&p->tail);
-        i64 pend = atomic_load(&p->pending);
-        if (h == t && pend == 0) break;
+        /* Re-broadcast: a worker may sample head, then have done set, then
+           enter FUTEX_WAIT after our first wake -- that wake would be lost. */
+        syscall6(SYS_futex, (long)&p->head,
+                 FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
+
+        if (atomic_load(&p->workers_exited) >= live) break;
         syscall1(SYS_sched_yield, 0);
     }
 }

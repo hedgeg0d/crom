@@ -2,6 +2,7 @@ CC       := clang
 CFLAGS   := -nostdlib -ffreestanding -static -O3 -march=native -pipe \
             -flto -fno-stack-protector -fno-pic \
             -fvisibility=hidden -ffunction-sections -fdata-sections \
+            -DCROM_NO_URING \
             -Wall -Wextra -Wno-unused-parameter
 ASFLAGS  := -nostdlib -static
 LDFLAGS  := -nostdlib -static -Wl,--gc-sections -Wl,--strip-all -fuse-ld=lld

@@ -126,16 +126,8 @@ static inline long is_mmap_err(void *p) {
 #define IORING_SETUP_SQ_AFF    4
 #define IORING_ENTER_GETEVENTS 1
 #define IORING_ENTER_SQ_WAKEUP 2
-#define IORING_OP_NOP       0
-#define IORING_OP_READV     1
-#define IORING_OP_WRITEV    2
-#define IORING_OP_FSYNC     3
-#define IORING_OP_READ_FIXED     4
-#define IORING_OP_WRITE_FIXED    5
-#define IORING_OP_OPENAT    18
-#define IORING_OP_CLOSE     19
-#define IORING_OP_STATX     30
-#define IOSQE_FIXED_FILE    (1U << 0)
+/* Opcodes and IOSQE_* flags live in iouring.h -- the copies that used to be
+   here disagreed with the kernel (STATX was 30, actually 21). */
 
 #define SEEK_SET  0
 #define SEEK_CUR  1
@@ -156,6 +148,16 @@ struct stat64 {
     long          st_size;
     long          st_blksize;
     long          st_blocks;
+    /* The kernel writes the full 144-byte x86-64 struct stat. Stopping at
+       st_blocks (80 bytes) makes every fstat/stat smash 64 bytes of the
+       caller's stack past the struct. */
+    unsigned long st_atime;
+    unsigned long st_atime_nsec;
+    unsigned long st_mtime;
+    unsigned long st_mtime_nsec;
+    unsigned long st_ctime;
+    unsigned long st_ctime_nsec;
+    long          __unused_stat[3];
 };
 
 #define STDIN_FILENO  0

@@ -9,8 +9,6 @@ i32 iouring_init(IOUring *r, u32 entries) {
 
     r->fd = fd;
     r->ring_entries = p.sq_entries;
-    r->sq_mask = p.sq_off.ring_mask;
-    r->cq_mask = p.cq_off.ring_mask;
 
     i64 sq_sz = p.sq_off.array + p.sq_entries * sizeof(u32);
     void *sq = (void *)syscall6(SYS_mmap, 0, (unsigned long)sq_sz,
@@ -47,6 +45,13 @@ i32 iouring_init(IOUring *r, u32 entries) {
     r->sq_array = (u32 *)((u8 *)sq + p.sq_off.array);
     r->cq_head = (u32 *)((u8 *)cq + p.cq_off.head);
     r->cq_tail = (u32 *)((u8 *)cq + p.cq_off.tail);
+
+    /* Every field of sq_off/cq_off is a BYTE OFFSET into the mapped ring, not
+       a value -- including ring_mask. Taking p.sq_off.ring_mask directly gives
+       the offset (typically 256), and `i & 256` collapses a whole batch onto
+       sqes[0]/cqes[0]. */
+    r->sq_mask = *(u32 *)((u8 *)sq + p.sq_off.ring_mask);
+    r->cq_mask = *(u32 *)((u8 *)cq + p.cq_off.ring_mask);
     r->cqes = (struct iouring_cqe *)((u8 *)cq + p.cq_off.cqes);
     r->sqes = (struct iouring_sqe *)sqes;
     r->sqe_head = 0;
@@ -55,59 +60,96 @@ i32 iouring_init(IOUring *r, u32 entries) {
     return 0;
 }
 
+/* Registers `nr` empty direct-descriptor slots. OPENAT with file_index=slot+1
+   installs into one; a linked READ then reaches it with IOSQE_FIXED_FILE. */
+i32 iouring_register_sparse_files(IOUring *r, u32 nr) {
+    i32 fds[256];
+    if (nr > 256) return -1;
+    for (u32 i = 0; i < nr; i++) fds[i] = -1;   /* -1 == sparse slot */
+
+    long rc = syscall4(SYS_io_uring_register, r->fd,
+                       IORING_REGISTER_FILES, (long)fds, nr);
+    return rc < 0 ? (i32)rc : 0;
+}
+
 void iouring_free(IOUring *r) {
     if (r->fd >= 0) syscall1(SYS_close, r->fd);
 }
 
-void iouring_sync(IOUring *r) {
-    r->sqe_head = *r->sq_head;
-    r->sqe_tail = r->sqe_head;
+u32 iouring_sq_space(IOUring *r) {
+    return r->ring_entries - (r->sqe_head - r->sqe_tail);
 }
 
 struct iouring_sqe *iouring_get_sqe(IOUring *r) {
-    u32 head = *r->sq_head;
-    u32 next = r->sqe_head + 1;
-
-    if (next - head > r->ring_entries) return 0;
+    /* sqe_head is our producer index, sqe_tail is how far the kernel has been
+       told to consume. Both count monotonically; they are never reset from the
+       ring's own head, which would rewind us over SQEs still in flight. */
+    if (r->sqe_head - r->sqe_tail >= r->ring_entries) return 0;
 
     struct iouring_sqe *sqe = &r->sqes[r->sqe_head & r->sq_mask];
-    r->sqe_head = next;
+    r->sqe_head++;
 
     for (i64 i = 0; i < (i64)sizeof(*sqe); i++) ((u8 *)sqe)[i] = 0;
 
     return sqe;
 }
 
-void iouring_submit(IOUring *r) {
-    u32 submitted = r->sqe_tail;
-    u32 to_submit = r->sqe_head - submitted;
+/* Submits everything staged by iouring_get_sqe() and, if wait_nr > 0, blocks
+   until that many CQEs are ready. Returns the number of SQEs the kernel
+   consumed (may be less than staged), or a negative errno. */
+i32 iouring_submit_and_wait(IOUring *r, u32 wait_nr) {
+    u32 to_submit = r->sqe_head - r->sqe_tail;
 
-    if (to_submit == 0) return;
+    if (to_submit == 0) {
+        if (wait_nr == 0) return 0;
+        return iouring_wait(r, wait_nr);
+    }
 
-    for (u32 i = submitted; i < r->sqe_head; i++)
+    for (u32 i = r->sqe_tail; i != r->sqe_head; i++)
         r->sq_array[i & r->sq_mask] = i & r->sq_mask;
-
-    r->sqe_tail = r->sqe_head;
 
     __asm__ volatile ("" ::: "memory");
     *r->sq_tail = r->sqe_head;
     __asm__ volatile ("" ::: "memory");
 
-    syscall6(SYS_io_uring_enter, r->fd, to_submit, to_submit, 0, 0, 0);
+    u32 total = 0;
+    while (total < to_submit) {
+        u32 want = wait_nr;
+        /* min_complete is only honoured when GETEVENTS is set; without it the
+           kernel returns straight after submitting and we would drain an
+           empty CQ. */
+        u32 flags = want ? IORING_ENTER_GETEVENTS : 0;
+
+        i32 n = (i32)syscall6(SYS_io_uring_enter, r->fd,
+                              to_submit - total, want, flags, 0, 0);
+        if (n < 0) {
+            if (n == -4 /*EINTR*/ || n == -11 /*EAGAIN*/) continue;
+            /* Nothing more will be consumed; un-publish the stragglers so the
+               ring tail never runs ahead of what we accounted for. */
+            r->sqe_tail += total;
+            *r->sq_tail = r->sqe_tail;
+            __asm__ volatile ("" ::: "memory");
+            r->sqe_head = r->sqe_tail;
+            return total ? (i32)total : n;
+        }
+        if (n == 0) break;
+        total += (u32)n;
+    }
+
+    r->sqe_tail += total;
+    return (i32)total;
 }
 
 i32 iouring_wait(IOUring *r, u32 nr) {
-    __asm__ volatile ("" ::: "memory");
-    u32 head = *r->cq_head;
-    u32 tail = *r->cq_tail;
-    u32 done = tail - head;
+    for (;;) {
+        __asm__ volatile ("" ::: "memory");
+        u32 done = *r->cq_tail - *r->cq_head;
+        if (done >= nr) return 0;
 
-    if (done >= nr) return 0;
-
-    i32 want = (i32)(nr - done);
-    syscall6(SYS_io_uring_enter, r->fd, 0, want, 0, 0, 0);
-
-    return 0;
+        i32 n = (i32)syscall6(SYS_io_uring_enter, r->fd, 0, nr - done,
+                              IORING_ENTER_GETEVENTS, 0, 0);
+        if (n < 0 && n != -4 /*EINTR*/ && n != -11 /*EAGAIN*/) return n;
+    }
 }
 
 i32 iouring_peek_cqe(IOUring *r, struct iouring_cqe **cqe) {
