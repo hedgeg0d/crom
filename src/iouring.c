@@ -93,7 +93,7 @@ void iouring_submit(IOUring *r) {
     *r->sq_tail = r->sqe_head;
     __asm__ volatile ("" ::: "memory");
 
-    syscall3(SYS_io_uring_enter, r->fd, to_submit, to_submit);
+    syscall6(SYS_io_uring_enter, r->fd, to_submit, to_submit, 0, 0, 0);
 }
 
 i32 iouring_wait(IOUring *r, u32 nr) {
@@ -105,8 +105,7 @@ i32 iouring_wait(IOUring *r, u32 nr) {
     if (done >= nr) return 0;
 
     i32 want = (i32)(nr - done);
-    i32 ret = (i32)syscall3(SYS_io_uring_enter, r->fd, 0, want);
-    if (ret < 0) return -1;
+    syscall6(SYS_io_uring_enter, r->fd, 0, want, 0, 0, 0);
 
     return 0;
 }

@@ -183,19 +183,13 @@ static i64 worker_fn(void *arg) {
 
         iouring_sync(&ring);
 
-        struct open_how { u64 flags; u64 mode; u64 resolve; } how;
-        how.flags = O_RDONLY|O_CLOEXEC;
-        how.mode = 0;
-        how.resolve = 0;
-
         for (i64 i = 0; i < count; i++) {
             struct iouring_sqe *sqe = iouring_get_sqe(&ring);
             if (!sqe) break;
-            sqe->opcode = IORING_OP_OPENAT2;
+            sqe->opcode = IORING_OP_OPENAT;
             sqe->fd = AT_FDCWD;
             sqe->addr = (u64)batch[i].path;
-            sqe->len = sizeof(how);
-            sqe->off = (u64)&how;
+            sqe->open_flags = O_RDONLY|O_CLOEXEC;
             sqe->user_data = batch[i].idx;
         }
 
