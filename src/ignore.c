@@ -30,7 +30,7 @@ i64 match_ignore(const char *name, i32 is_dir) {
 
 static i64 git_match_rule(const GitRule *r, const char *name, i32 is_dir) {
     const char *p = r->pat;
-    if (*p == '/') p++; // anchored, already consumed by caller logic
+    if (*p == '/') p++;
     if (!*p) return 1;
 
     if (r->dir_only && !is_dir) return 0;
@@ -66,59 +66,71 @@ static i64 git_parse_line(char *line, GitRule *r) {
 
     r->dir_only = 0;
     if (plen > 0 && pat[plen-1] == '/') { r->dir_only = 1; plen--; pat[plen] = 0; }
+    if (plen == 0) return 0;
 
     r->anchored = (pat[0] == '/');
     r->pat = pat;
     return 1;
 }
 
-void gitignore_load(GitList *gl, const char *dir_path, i64 dir_len) {
-    gl->count = 0;
-    gl->buf_len = 0;
-
+const GitNode *gitignore_load(Bump *ar, const GitNode *parent,
+                              const char *dir, i64 dir_len) {
     char gpath[4096];
+    if (dir_len + 12 >= (i64)sizeof(gpath)) return parent;
+
     i64 pos = 0;
-    for (i64 i = 0; i < dir_len; i++) gpath[pos++] = dir_path[i];
+    for (i64 i = 0; i < dir_len; i++) gpath[pos++] = dir[i];
     if (pos > 0 && gpath[pos-1] != '/') gpath[pos++] = '/';
-    gpath[pos++] = '.'; gpath[pos++] = 'g'; gpath[pos++] = 'i';
-    gpath[pos++] = 't'; gpath[pos++] = 'i'; gpath[pos++] = 'g';
-    gpath[pos++] = 'n'; gpath[pos++] = 'o'; gpath[pos++] = 'r';
-    gpath[pos++] = 'e'; gpath[pos] = 0;
+    const char *g = ".gitignore";
+    for (i64 i = 0; i < 10; i++) gpath[pos++] = g[i];
+    gpath[pos] = 0;
 
     i32 fd = (i32)syscall3(SYS_openat, AT_FDCWD, (long)gpath, O_RDONLY|O_CLOEXEC);
-    if (fd < 0) return;
+    if (fd < 0) return parent;
 
     char rbuf[4096];
     i64 n = (i64)syscall3(SYS_read, fd, (long)rbuf, sizeof(rbuf) - 1);
     syscall1(SYS_close, fd);
-    if (n <= 0) return;
+    if (n <= 0) return parent;
     rbuf[n] = 0;
 
+    GitRule tmp[GR_MAX];
+    i64 cnt = 0;
     char *line = rbuf;
-    while (line < rbuf + n && gl->count < GR_MAX) {
+    char *lim = rbuf + n;
+    while (line < lim && cnt < GR_MAX) {
         char *end = line;
-        while (end < rbuf + n && *end != '\n') end++;
-        if (end < rbuf + n) *end = 0;
-
-        GitRule r;
-        if (git_parse_line(line, &r)) {
-            i64 pl = str_len(r.pat);
-            for (i64 i = 0; i < pl; i++) gl->buf[gl->buf_len++] = r.pat[i];
-            gl->buf[gl->buf_len++] = 0;
-            r.pat = gl->buf + gl->buf_len - pl - 1;
-            gl->rules[gl->count++] = r;
-        }
-
+        while (end < lim && *end != '\n') end++;
+        if (end < lim) *end = 0;
+        if (git_parse_line(line, &tmp[cnt])) cnt++;
         line = end + 1;
     }
+    if (!cnt) return parent;
+
+    i64 patbytes = 0;
+    for (i64 i = 0; i < cnt; i++) patbytes += str_len(tmp[i].pat) + 1;
+
+    GitNode *nd = (GitNode *)bump_alloc(ar,
+        (i64)sizeof(GitNode) + cnt * (i64)sizeof(GitRule) + patbytes);
+    if (!nd) return parent;   /* arena exhausted: fall back to inherited rules */
+
+    char *pb = (char *)(nd->rules + cnt);
+    for (i64 i = 0; i < cnt; i++) {
+        i64 l = str_len(tmp[i].pat);
+        for (i64 k = 0; k <= l; k++) pb[k] = tmp[i].pat[k];
+        nd->rules[i] = tmp[i];
+        nd->rules[i].pat = pb;
+        pb += l + 1;
+    }
+    nd->parent = parent;
+    nd->count = cnt;
+    return nd;
 }
 
-i64 gitignore_check(GitList *gl, const char *name, i32 is_dir) {
-    i64 result = 0;
-    for (i64 i = 0; i < gl->count; i++) {
-        GitRule *r = &gl->rules[i];
-        if (git_match_rule(r, name, is_dir))
-            result = r->negate ? 0 : 1;
-    }
-    return result;
+i64 gitignore_check(const GitNode *n, const char *name, i32 is_dir) {
+    for (; n; n = n->parent)
+        for (i64 i = n->count - 1; i >= 0; i--)
+            if (git_match_rule(&n->rules[i], name, is_dir))
+                return n->rules[i].negate ? 0 : 1;
+    return 0;
 }

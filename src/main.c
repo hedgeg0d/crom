@@ -6,17 +6,15 @@
 #include "pool.h"
 #include "display.h"
 #include "ignore.h"
+#include "match_content.h"
 
 static const char *prog = "crom";
 static const char *pattern;
 static const char *needle;
 static i64 needle_len;
 static i64 num_threads;
-static Pool pool_data;
-static Pool *pool;
-static volatile i64 g_dirs;
-static volatile i64 g_files;
-static volatile i64 g_matches;
+static Scanner scanner;
+static i64 g_matches;
 static i64 g_bar;
 static i64 g_use_ignore = 1;
 static int  g_type_filter;  /* 0=any, 'f','d','l' */
@@ -25,34 +23,8 @@ static i64 g_size_val;
 static i64 g_max_depth = -1;
 static i64 g_json;
 static i64 g_color = 1;
+static i64 g_binary;   /* -a: search binary files too */
 static const char *g_exec_cmd;
-static i64 g_exec_batch;
-
-static void exec_file(const char *path, i64 len) {
-    char buf[4096];
-    i64 pos = 0;
-    const char *c = g_exec_cmd;
-    while (*c) {
-        if (*c == '{' && c[1] == '}') {
-            for (i64 i = 0; i < len; i++) buf[pos++] = path[i];
-            c += 2;
-        } else {
-            buf[pos++] = *c++;
-        }
-    }
-    buf[pos] = 0;
-
-    i64 pid = syscall0(SYS_fork);
-    if (pid < 0) return;
-    if (pid == 0) {
-        const char *argv[] = {"/bin/sh", "-c", buf, 0};
-        const char *envp[] = {"PATH=/usr/bin:/bin:/usr/sbin", 0};
-        syscall3(SYS_execve, (long)"/bin/sh", (long)argv, (long)envp);
-        syscall1(SYS_exit, 1);
-    }
-    i32 status;
-    syscall4(SYS_wait4, pid, (long)&status, 0, 0);
-}
 
 static i64 is_tty(i64 fd) {
     struct stat64 st;
@@ -76,6 +48,8 @@ static void usage(void) {
     write_str(STDOUT_FILENO, "  \033[33m-e\033[0m, \033[33m--exec\033[0m <cmd> {}    Execute command per result\n");
     write_str(STDOUT_FILENO, "  \033[33m-j\033[0m, \033[33m--threads\033[0m <N>     Worker threads\n");
     write_str(STDOUT_FILENO, "  \033[33m--color\033[0m <when>        auto|always|never\n");
+    write_str(STDOUT_FILENO, "  \033[33m-a\033[0m, \033[33m--text\033[0m            Search binary files too\n");
+    write_str(STDOUT_FILENO, "  \033[33m--no-ignore\033[0m           Ignore .gitignore rules\n");
     write_str(STDOUT_FILENO, "  \033[33m--json\033[0m               JSON output\n");
     write_str(STDOUT_FILENO, "  \033[33m--bar\033[0m                Progress bar + spinner\n");
     write_str(STDOUT_FILENO, "  \033[33m-h\033[0m, \033[33m--help\033[0m            Show help\n");
@@ -86,75 +60,6 @@ static void usage(void) {
     write_str(STDOUT_FILENO, "  crom -n '*.rs' -s +1m         Rust files > 1MB\n");
     write_str(STDOUT_FILENO, "  crom -t f -c 'fn main' src/   Files with 'fn main'\n");
     write_str(STDOUT_FILENO, "  crom '**/test*' --bar         Test files, with progress\n");
-}
-
-static i64 size_filter_pass(i64 sz) {
-    if (!g_size_cmp) return 1;
-    if (g_size_cmp > 0) return sz > g_size_val;
-    return sz < g_size_val;
-}
-
-static void print_hit(const char *path, i64 len) {
-    if (g_json) {
-        write_str(STDOUT_FILENO, "{\"path\":\"");
-        for (i64 i = 0; i < len; i++) {
-            char c = path[i];
-            if (c == '"' || c == '\\') write_all(STDOUT_FILENO, "\\", 1);
-            write_all(STDOUT_FILENO, path + i, 1);
-        }
-        write_str(STDOUT_FILENO, "\"}\n");
-    } else {
-        write_all(STDOUT_FILENO, path, len);
-        write_all(STDOUT_FILENO, "\n", 1);
-    }
-}
-
-static void on_file(const char *path, i64 len, u8 dtype, void *ctx) {
-    (void)ctx;
-
-    if (dtype == DT_DIR) {
-        g_dirs++;
-        if (g_bar && (g_dirs & 63) == 0) display_update(g_dirs, g_files, g_matches);
-    } else if (dtype == DT_REG) {
-        g_files++;
-    } else {
-        return;
-    }
-
-    if (g_type_filter) {
-        if (g_type_filter == 'f' && dtype != DT_REG) return;
-        if (g_type_filter == 'd' && dtype != DT_DIR) return;
-        if (g_type_filter == 'l' && dtype != DT_LNK) return;
-    } else if (dtype != DT_REG) {
-        return;
-    }
-
-    if (pattern) {
-        const char *name = path + len;
-        while (name > path && name[-1] != '/') name--;
-        if (!match_glob(pattern, name)) return;
-    }
-
-    if (g_size_cmp) {
-        i32 fd = (i32)syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
-        if (fd < 0) return;
-        struct stat64 st;
-        i64 ok = syscall2(SYS_fstat, fd, (long)&st) >= 0 && size_filter_pass(st.st_size);
-        syscall1(SYS_close, fd);
-        if (!ok) return;
-    }
-
-    if (pool) {
-        pool_push(pool, path, len, dtype);
-    } else if (g_exec_cmd) {
-        g_matches++;
-        if (g_bar && (g_matches & 15) == 0) display_update(g_dirs, g_files, g_matches);
-        exec_file(path, len);
-    } else {
-        g_matches++;
-        if (g_bar && (g_matches & 15) == 0) display_update(g_dirs, g_files, g_matches);
-        print_hit(path, len);
-    }
 }
 
 static i64 parse_int(const char *s) {
@@ -233,6 +138,10 @@ int crom_main(int argc, char **argv) {
             if (i + 1 < argc) num_threads = parse_int(argv[++i]);
             continue;
         }
+        if (argv[i][0] == '-' && argv[i][1] == 'j' && argv[i][2]) {
+            num_threads = parse_int(argv[i] + 2);
+            continue;
+        }
         if (str_eq(argv[i], "-t") || str_eq(argv[i], "--type")) {
             if (i + 1 < argc) g_type_filter = argv[++i][0];
             continue;
@@ -247,6 +156,10 @@ int crom_main(int argc, char **argv) {
         }
         if (str_eq(argv[i], "--bar")) {
             g_bar = 1;
+            continue;
+        }
+        if (str_eq(argv[i], "-a") || str_eq(argv[i], "--text")) {
+            g_binary = 1;
             continue;
         }
         if (str_eq(argv[i], "--no-ignore")) {
@@ -289,22 +202,27 @@ int crom_main(int argc, char **argv) {
 
     if (g_bar) display_init();
     ignore_set_enabled(g_use_ignore);
+    if (needle) content_prepare(needle, needle_len);
+    content_set_text_only(!g_binary);
 
-    if (needle) {
-        pool = &pool_data;
-        pool_init(pool, num_threads);
-        pool->json_out = g_json;
-        pool_spawn(pool, needle, needle_len);
-    }
+    ScanCfg cfg;
+    cfg.pattern     = pattern;
+    cfg.needle      = needle;
+    cfg.needle_len  = needle_len;
+    cfg.exec_cmd    = g_exec_cmd;
+    cfg.type_filter = g_type_filter;
+    cfg.size_cmp    = g_size_cmp;
+    cfg.size_val    = g_size_val;
+    cfg.max_depth   = g_max_depth;
+    cfg.json_out    = g_json;
+    cfg.use_ignore  = g_use_ignore;
+    cfg.bar         = g_bar;
+    cfg.num_workers = num_threads;
 
-    walk(target, on_file, 0, g_max_depth);
+    g_matches = scan_run(&scanner, &cfg, target);
 
-    if (pool) {
-        pool_flush(pool);
-        g_matches = pool->matches;
-    }
-
-    if (g_bar) display_done(g_dirs, g_files, g_matches, 0);
+    if (g_bar)
+        display_done(scanner.n_dirs, scanner.n_files, g_matches, 0);
 
     return 0;
 }

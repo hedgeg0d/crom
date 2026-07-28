@@ -2,15 +2,21 @@
 #include "atomics.h"
 #include "syscalls.h"
 #include "util.h"
+#include "walk.h"
+#include "match_name.h"
 #include "match_content.h"
-#include "iouring.h"
+#include "display.h"
 
-static const char *g_needle;
-static i64 g_nlen;
-
-static volatile i64 g_out_lock;
+#define OBUF_SZ   16384
+#define RBUF_SZ   32768
+#define DBUF_SZ   32768
+#define PBUF_SZ   4096
+#define LSTK_CHUNK 256
+#define ARENA_CAP (512L << 20)   /* reservation only; MAP_NORESERVE */
 
 extern void clone_trampoline(void);
+
+static volatile i64 g_out_lock;
 
 static void out_lock(void) {
     while (atomic_cas(&g_out_lock, 0, 1) != 0) {
@@ -25,330 +31,342 @@ static void out_unlock(void) {
              FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
 }
 
-void pool_init(Pool *p, i64 workers) {
-    p->head = 0;
-    p->tail = 0;
-    p->done = 0;
-    p->pending = 0;
-    p->matches = 0;
-    p->workers_live = 0;
-    p->workers_exited = 0;
-    p->num_workers = workers > 0 ? workers : 1;
+typedef struct LBlk {
+    struct LBlk *prev;
+    DirRef it[LSTK_CHUNK];
+} LBlk;
 
-    for (i64 i = 0; i < POOL_QUEUE_CAP; i++) p->items[i].seq = i;
+typedef struct {
+    Scanner *s;
+    LBlk *top;
+    LBlk *freelist;
+    i64 ln;
+    i64 olen;
+    i64 c_dirs, c_files, c_matches;
+    char obuf[OBUF_SZ];
+    u8 rbuf[RBUF_SZ];
+} Worker;
+
+static i64 lstk_push(Worker *w, const DirRef *d) {
+    if (!w->top || w->ln == LSTK_CHUNK) {
+        LBlk *b = w->freelist;
+        if (b) w->freelist = b->prev;
+        else b = (LBlk *)bump_alloc(&w->s->arena, sizeof(LBlk));
+        if (!b) return 0;
+        b->prev = w->top;
+        w->top = b;
+        w->ln = 0;
+    }
+    w->top->it[w->ln++] = *d;
+    return 1;
 }
 
-/* Claimed slot t -> copy payload out, then hand the slot back to the
-   producer. Must run before returning, since the producer is free to refill
-   the slot the moment seq is bumped. */
-static void slot_take(Pool *p, i64 t, char *path, i64 *len, u8 *dtype) {
-    PoolItem *it = &p->items[t & (POOL_QUEUE_CAP - 1)];
-
-    while (atomic_load(&it->seq) != t + 1) syscall1(SYS_sched_yield, 0);
-
-    i64 n = it->len;
-    for (i64 i = 0; i < n; i++) path[i] = it->path[i];
-    path[n] = 0;
-    *len = n;
-    *dtype = it->dtype;
-
-    atomic_store(&it->seq, t + POOL_QUEUE_CAP);
+static i64 lstk_pop(Worker *w, DirRef *d) {
+    while (w->top && w->ln == 0) {
+        LBlk *b = w->top;
+        w->top = b->prev;
+        b->prev = w->freelist;
+        w->freelist = b;
+        w->ln = w->top ? LSTK_CHUNK : 0;
+    }
+    if (!w->top) return 0;
+    *d = w->top->it[--w->ln];
+    return 1;
 }
 
-i64 pool_pop(Pool *p, char *path, i64 *len, u8 *dtype) {
+static i64 q_push(Scanner *s, const DirRef *d) {
     for (;;) {
-        i64 t = atomic_load(&p->tail);
-        i64 h = atomic_load(&p->head);
-
-        if (t >= h) {
-            if (atomic_load(&p->done)) return -1;
-            atomic_xadd(&p->waiters, 1);
-            /* Re-check after registering: done/head may have changed between
-               the checks above and the sleep, and that wake would be lost. */
-            if (!atomic_load(&p->done) && atomic_load(&p->head) == h)
-                syscall6(SYS_futex, (long)&p->head,
-                         FUTEX_WAIT|FUTEX_PRIVATE_FLAG, h, 0, 0, 0);
-            atomic_xadd(&p->waiters, -1);
-            continue;
+        i64 pos = atomic_load(&s->head);
+        ScanSlot *sl = &s->q[pos & (SCAN_QUEUE_CAP - 1)];
+        i64 dif = atomic_load(&sl->seq) - pos;
+        if (dif == 0) {
+            if (atomic_cas(&s->head, pos, pos + 1) == pos) {
+                sl->d = *d;
+                atomic_store(&sl->seq, pos + 1);
+                return 1;
+            }
+        } else if (dif < 0) {
+            return 0;               /* full */
         }
-
-        if (atomic_cas(&p->tail, t, t + 1) != t) continue;
-
-        atomic_xadd(&p->pending, 1);
-        slot_take(p, t, path, len, dtype);
-        return 0;
     }
 }
 
-i64 pool_try_pop(Pool *p, char *path, i64 *len, u8 *dtype) {
+static i64 q_pop(Scanner *s, DirRef *d) {
     for (;;) {
-        i64 t = atomic_load(&p->tail);
-        i64 h = atomic_load(&p->head);
-
-        if (t >= h) return -1;
-
-        if (atomic_cas(&p->tail, t, t + 1) != t) continue;
-
-        atomic_xadd(&p->pending, 1);
-        slot_take(p, t, path, len, dtype);
-        return 0;
+        i64 pos = atomic_load(&s->tail);
+        ScanSlot *sl = &s->q[pos & (SCAN_QUEUE_CAP - 1)];
+        i64 dif = atomic_load(&sl->seq) - (pos + 1);
+        if (dif == 0) {
+            if (atomic_cas(&s->tail, pos, pos + 1) == pos) {
+                *d = sl->d;
+                atomic_store(&sl->seq, pos + SCAN_QUEUE_CAP);
+                return 1;
+            }
+        } else if (dif < 0) {
+            return 0;               /* empty */
+        }
     }
 }
 
-i64 pool_push(Pool *p, const char *path, i64 len, u8 dtype) {
-    if (len >= POOL_PATH_SZ) return -1;
-
-    i64 h = atomic_load(&p->head);
-    PoolItem *it = &p->items[h & (POOL_QUEUE_CAP - 1)];
-
-    /* Free only once the previous occupant's consumer has copied out. */
-    while (atomic_load(&it->seq) != h) syscall1(SYS_sched_yield, 0);
-
-    for (i64 i = 0; i < len; i++) it->path[i] = path[i];
-    it->path[len] = 0;
-    it->len = len;
-    it->dtype = dtype;
-
-    atomic_store(&it->seq, h + 1);
-    atomic_store(&p->head, h + 1);
-
-    if (atomic_load(&p->waiters) > 0)
-        syscall6(SYS_futex, (long)&p->head,
-                 FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
-    return 0;
+static void wake_all(Scanner *s) {
+    syscall6(SYS_futex, (long)&s->work_gen,
+             FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
 }
 
-#define OBUF_SZ 16384
-#define BATCH_SZ 32
+static void publish(Scanner *s, Worker *w, const DirRef *d) {
+    atomic_xadd(&s->active, 1);
+    if (q_push(s, d)) {
+        atomic_xadd(&s->work_gen, 1);
+        if (atomic_load(&s->idle) > 0) wake_all(s);
+    } else if (!lstk_push(w, d)) {
+        atomic_xadd(&s->active, -1);   /* arena exhausted */
+    }
+}
 
 static void buf_add(char *buf, i64 *olen, const char *p, i64 plen) {
     for (i64 i = 0; i < plen; i++) buf[(*olen)++] = p[i];
 }
 
-static void buf_emit(Pool *p, const char *path, i64 len, char *obuf, i64 *olen) {
-    if (p->json_out) {
-        if (*olen + len + 16 > OBUF_SZ) {
-            out_lock();
-            write_all(STDOUT_FILENO, obuf, *olen);
-            out_unlock();
-            *olen = 0;
-        }
-        buf_add(obuf, olen, "{\"path\":\"", 9);
+static void buf_flush(Worker *w) {
+    if (w->olen <= 0) return;
+    out_lock();
+    write_all(STDOUT_FILENO, w->obuf, w->olen);
+    out_unlock();
+    w->olen = 0;
+}
+
+static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
+    if (json) {
+        if (w->olen + 2 * len + 16 > OBUF_SZ) buf_flush(w);
+        buf_add(w->obuf, &w->olen, "{\"path\":\"", 9);
         for (i64 i = 0; i < len; i++) {
-            if (path[i] == '"' || path[i] == '\\') obuf[(*olen)++] = '\\';
-            obuf[(*olen)++] = path[i];
+            if (path[i] == '"' || path[i] == '\\') w->obuf[w->olen++] = '\\';
+            w->obuf[w->olen++] = path[i];
         }
-        buf_add(obuf, olen, "\"}\n", 3);
+        buf_add(w->obuf, &w->olen, "\"}\n", 3);
     } else {
-        if (*olen + len + 1 > OBUF_SZ) {
-            out_lock();
-            write_all(STDOUT_FILENO, obuf, *olen);
-            out_unlock();
-            *olen = 0;
-        }
-        buf_add(obuf, olen, path, len);
-        obuf[(*olen)++] = '\n';
+        if (w->olen + len + 1 > OBUF_SZ) buf_flush(w);
+        buf_add(w->obuf, &w->olen, path, len);
+        w->obuf[w->olen++] = '\n';
     }
 }
 
-typedef struct {
-    char path[POOL_PATH_SZ];
-    i64 len;
-} BatchSlot;
-
-/* Each file is one chain of three linked SQEs. user_data carries the batch
-   index and which link it came from, since every SQE posts its own CQE. */
-#define UD_MAKE(i, kind) (((u64)(i) << 2) | (u64)(kind))
-#define UD_IDX(ud)       ((i64)((ud) >> 2))
-#define UD_KIND(ud)      ((u32)((ud) & 3))
-#define UD_OPEN  0
-#define UD_READ  1
-#define UD_CLOSE 2
-
-#define RBUF_SZ  32768
-#define SQE_PER_FILE 3
-/* Out of band for a read result, which is either a byte count or -errno.
-   -1 cannot be used: that is a legitimate -EPERM from the open. */
-#define RRES_SYNC 0x7fffffff
-
-static i64 worker_fn(void *arg) {
-    Pool *p = (Pool *)arg;
-    char obuf[OBUF_SZ];
-    i64 olen = 0;
-    IOUring ring;
-    i64 use_ring = 0;
-    u8 *rbufs = 0;
-
-#ifndef CROM_NO_URING
-    /* Ring must hold a whole batch of chains, plus a registered file table
-       with one direct-descriptor slot per in-flight file. */
-    if (iouring_init(&ring, BATCH_SZ * SQE_PER_FILE) == 0) {
-        if (iouring_register_sparse_files(&ring, BATCH_SZ) == 0) {
-            rbufs = (u8 *)syscall6(SYS_mmap, 0, BATCH_SZ * RBUF_SZ,
-                                   PROT_READ|PROT_WRITE,
-                                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-            if (is_mmap_err(rbufs)) rbufs = 0;
-            else use_ring = 1;
-        }
-        if (!use_ring) iouring_free(&ring);
-    }
-#endif
-
-    if (!use_ring) {
-        u8 rbuf[RBUF_SZ];
-        for (;;) {
-            char path[POOL_PATH_SZ]; i64 len; u8 dtype;
-            if (pool_pop(p, path, &len, &dtype) < 0) break;
-            i64 match = 1;
-            if (g_needle)
-                match = search_file(path, g_needle, g_nlen, rbuf, sizeof(rbuf));
-            if (match) {
-                atomic_xadd(&p->matches, 1);
-                buf_emit(p, path, len, obuf, &olen);
-            }
-            atomic_xadd(&p->pending, -1);
-        }
-        goto done;
-    }
-
-    {
-    BatchSlot batch[BATCH_SZ];
-    i32 rres[BATCH_SZ];
-
-    for (;;) {
-        u8 dtype;
-        if (pool_pop(p, batch[0].path, &batch[0].len, &dtype) < 0)
-            break;
-        i64 count = 1;
-
-        while (count < BATCH_SZ) {
-            if (pool_try_pop(p, batch[count].path, &batch[count].len, &dtype) < 0)
-                break;
-            count++;
-        }
-
-        for (i64 i = 0; i < count; i++) rres[i] = RRES_SYNC;
-
-        i64 staged = 0;
-        for (i64 i = 0; i < count; i++) {
-            if (iouring_sq_space(&ring) < SQE_PER_FILE) break;
-
-            /* OPENAT into direct-descriptor slot i (file_index is slot+1).
-               IO_LINK: if the open fails, the read and close are cancelled. */
-            struct iouring_sqe *o = iouring_get_sqe(&ring);
-            o->opcode = IORING_OP_OPENAT;
-            o->flags = IOSQE_IO_LINK;
-            o->fd = AT_FDCWD;
-            o->addr = (u64)batch[i].path;
-            /* io_openat_prep rejects O_CLOEXEC together with file_index:
-               a direct descriptor never lands in the fd table. */
-            o->open_flags = O_RDONLY;
-            o->file_index = (u32)i + 1;
-            o->user_data = UD_MAKE(i, UD_OPEN);
-
-            /* READ addresses that slot via FIXED_FILE. HARDLINK so the close
-               still runs even when the read errors (e.g. EISDIR). */
-            struct iouring_sqe *rd = iouring_get_sqe(&ring);
-            rd->opcode = IORING_OP_READ;
-            rd->flags = IOSQE_FIXED_FILE|IOSQE_IO_HARDLINK;
-            rd->fd = (i32)i;
-            rd->addr = (u64)(rbufs + i * RBUF_SZ);
-            rd->len = RBUF_SZ;
-            rd->off = 0;
-            rd->user_data = UD_MAKE(i, UD_READ);
-
-            /* Direct close: fd must be 0 and the slot goes in file_index.
-               FIXED_FILE is rejected by close_prep, so flags stay clear. */
-            struct iouring_sqe *c = iouring_get_sqe(&ring);
-            c->opcode = IORING_OP_CLOSE;
-            c->fd = 0;
-            c->file_index = (u32)i + 1;
-            c->user_data = UD_MAKE(i, UD_CLOSE);
-
-            staged++;
-        }
-
-        u32 nsqe = (u32)(staged * SQE_PER_FILE);
-        i32 got = nsqe ? iouring_submit_and_wait(&ring, nsqe) : 0;
-
-        /* Drain whatever the ring produced; one CQE per SQE, chains included. */
-        for (i32 n = 0; n < got; n++) {
-            struct iouring_cqe *cqe;
-            if (!iouring_peek_cqe(&ring, &cqe)) {
-                if (iouring_wait(&ring, 1) < 0) break;
-                if (!iouring_peek_cqe(&ring, &cqe)) break;
-            }
-            i32 res = cqe->res;
-            u64 ud = cqe->user_data;
-            iouring_cqe_seen(&ring, cqe);
-
-            i64 idx = UD_IDX(ud);
-            if (UD_KIND(ud) == UD_READ && idx >= 0 && idx < count)
-                rres[idx] = res;
-        }
-
-        /* A partial submit could split a chain, so treat it as "all sync". */
-        if (got != (i32)nsqe)
-            for (i64 i = 0; i < count; i++) rres[i] = RRES_SYNC;
-
-        for (i64 i = 0; i < count; i++) {
-            i64 match = 0;
-            i32 n = rres[i];
-
-            if (n >= 0 && n < RBUF_SZ) {
-                /* Whole file is in the buffer: a short read on a regular file
-                   only happens at EOF. */
-                match = content_search(rbufs + i * RBUF_SZ, n, g_needle, g_nlen);
-            } else if (n == RBUF_SZ || n == RRES_SYNC) {
-                /* Buffer filled means the file may be longer than RBUF_SZ;
-                   RRES_SYNC means it never went through the ring. Both need
-                   the synchronous path, which mmaps anything oversized. */
-                u8 *scratch = rbufs + i * RBUF_SZ;
-                match = search_file(batch[i].path, g_needle, g_nlen,
-                                    scratch, RBUF_SZ);
-            }
-            /* Anything else is a real -errno from open/read: not a match. */
-
-            if (match) {
-                atomic_xadd(&p->matches, 1);
-                buf_emit(p, batch[i].path, batch[i].len, obuf, &olen);
-            }
-            atomic_xadd(&p->pending, -1);
+static void exec_file(const char *cmd, const char *path, i64 len) {
+    char buf[PBUF_SZ];
+    i64 pos = 0;
+    const char *c = cmd;
+    while (*c && pos + len + 2 < (i64)sizeof(buf)) {
+        if (*c == '{' && c[1] == '}') {
+            for (i64 i = 0; i < len; i++) buf[pos++] = path[i];
+            c += 2;
+        } else {
+            buf[pos++] = *c++;
         }
     }
+    buf[pos] = 0;
+
+    i64 pid = syscall0(SYS_fork);
+    if (pid < 0) return;
+    if (pid == 0) {
+        const char *argv[] = {"/bin/sh", "-c", buf, 0};
+        const char *envp[] = {"PATH=/usr/bin:/bin:/usr/sbin", 0};
+        syscall3(SYS_execve, (long)"/bin/sh", (long)argv, (long)envp);
+        syscall1(SYS_exit, 1);
+    }
+    i32 status;
+    syscall4(SYS_wait4, pid, (long)&status, 0, 0);
+}
+
+static i64 size_pass(const ScanCfg *c, i64 dirfd, const char *name) {
+    i32 fd = (i32)syscall3(SYS_openat, dirfd, (long)name, O_RDONLY|O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct stat64 st;
+    i64 ok = syscall2(SYS_fstat, fd, (long)&st) >= 0;
+    if (ok) ok = c->size_cmp > 0 ? st.st_size > c->size_val
+                                 : st.st_size < c->size_val;
+    syscall1(SYS_close, fd);
+    return ok;
+}
+
+static void consider(Scanner *s, Worker *w, i64 dirfd, const char *path,
+                     i64 len, const char *name, u8 type) {
+    const ScanCfg *c = s->cfg;
+
+    if (c->type_filter) {
+        if (c->type_filter == 'f' && type != DT_REG) return;
+        if (c->type_filter == 'd' && type != DT_DIR) return;
+        if (c->type_filter == 'l' && type != DT_LNK) return;
+    } else if (type != DT_REG) {
+        return;
     }
 
-    syscall2(SYS_munmap, (long)rbufs, BATCH_SZ * RBUF_SZ);
-    iouring_free(&ring);
+    if (c->pattern && !match_glob(c->pattern, name)) return;
+    if (c->size_cmp && !size_pass(c, dirfd, name)) return;
+    if (c->needle &&
+        !search_file_at(dirfd, name, c->needle, c->needle_len,
+                        w->rbuf, RBUF_SZ)) return;
 
-done:
-    if (olen > 0) {
+    w->c_matches++;
+
+    if (c->exec_cmd) {
         out_lock();
-        write_all(STDOUT_FILENO, obuf, olen);
+        exec_file(c->exec_cmd, path, len);
         out_unlock();
+    } else {
+        buf_emit(w, path, len, c->json_out);
+    }
+}
+
+static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
+    i64 fd = syscall3(SYS_openat, AT_FDCWD, (long)d->path,
+                      O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (fd < 0) return;
+
+    const ScanCfg *c = s->cfg;
+    const GitNode *ign = d->ign;
+    if (c->use_ignore)
+        ign = gitignore_load(&s->arena, ign, d->path, d->len);
+
+    char pbuf[PBUF_SZ];
+    i64 plen = d->len;
+    if (plen >= PBUF_SZ - 2) { syscall1(SYS_close, fd); return; }
+    for (i64 i = 0; i < plen; i++) pbuf[i] = d->path[i];
+    if (plen == 0) pbuf[plen++] = '.';
+    if (pbuf[plen - 1] != '/') pbuf[plen++] = '/';
+    i64 prefix = plen;
+
+    u8 dbuf[DBUF_SZ];
+    for (;;) {
+        i64 n = syscall3(SYS_getdents64, fd, (long)dbuf, DBUF_SZ);
+        if (n <= 0) break;
+
+        for (i64 pos = 0; pos < n; ) {
+            struct linux_dirent64 *e = (struct linux_dirent64 *)(dbuf + pos);
+            pos += e->d_reclen;
+
+            const char *name = e->d_name;
+            if (name[0] == '.') {
+                if (name[1] == 0) continue;
+                if (name[1] == '.' && name[2] == 0) continue;
+            }
+
+            u8 type = e->d_type;
+            i32 is_dir = (type == DT_DIR);
+            if (is_dir && match_ignore(name, 1)) continue;
+            if (c->use_ignore && gitignore_check(ign, name, is_dir)) continue;
+
+            i64 nl = str_len(name);
+            if (prefix + nl >= PBUF_SZ) continue;
+            for (i64 i = 0; i < nl; i++) pbuf[prefix + i] = name[i];
+            i64 flen = prefix + nl;
+            pbuf[flen] = 0;
+
+            if (is_dir) {
+                w->c_dirs++;
+                if (c->bar && (w->c_dirs & 63) == 0) {
+                    display_update(atomic_load(&s->n_dirs) + w->c_dirs,
+                                   atomic_load(&s->n_files) + w->c_files,
+                                   atomic_load(&s->n_matches) + w->c_matches);
+                }
+
+                i64 cd = d->depth + 1;
+                if (c->max_depth < 0 || cd <= c->max_depth) {
+                    char *cp = (char *)bump_alloc(&s->arena, flen + 1);
+                    if (cp) {
+                        for (i64 i = 0; i <= flen; i++) cp[i] = pbuf[i];
+                        DirRef sub;
+                        sub.path = cp;
+                        sub.len = (i32)flen;
+                        sub.depth = (i32)cd;
+                        sub.ign = ign;
+                        publish(s, w, &sub);
+                    }
+                }
+            } else if (type == DT_REG) {
+                w->c_files++;
+            }
+
+            consider(s, w, fd, pbuf, flen, name, type);
+        }
     }
 
-    /* Publish the flush before pool_flush() is allowed to let main exit. */
-    atomic_xadd(&p->workers_exited, 1);
-    syscall6(SYS_futex, (long)&p->workers_exited,
+    syscall1(SYS_close, fd);
+}
+
+static void worker_loop(Scanner *s, Worker *w) {
+    for (;;) {
+        DirRef d;
+
+        if (lstk_pop(w, &d) || q_pop(s, &d)) {
+            scan_dir(s, w, &d);
+            if (atomic_xadd(&s->active, -1) == 1) {
+                atomic_store(&s->done, 1);
+                atomic_xadd(&s->work_gen, 1);
+                wake_all(s);
+            }
+            continue;
+        }
+
+        if (atomic_load(&s->done)) break;
+
+        atomic_xadd(&s->idle, 1);
+        i64 gen = atomic_load(&s->work_gen);
+        if (q_pop(s, &d)) {
+            atomic_xadd(&s->idle, -1);
+            scan_dir(s, w, &d);
+            if (atomic_xadd(&s->active, -1) == 1) {
+                atomic_store(&s->done, 1);
+                atomic_xadd(&s->work_gen, 1);
+                wake_all(s);
+            }
+            continue;
+        }
+        if (!atomic_load(&s->done) && atomic_load(&s->work_gen) == gen)
+            syscall6(SYS_futex, (long)&s->work_gen,
+                     FUTEX_WAIT|FUTEX_PRIVATE_FLAG, (i32)gen, 0, 0, 0);
+        atomic_xadd(&s->idle, -1);
+    }
+}
+
+static void worker_init(Worker *w, Scanner *s) {
+    w->s = s; w->top = 0; w->freelist = 0; w->ln = 0; w->olen = 0;
+    w->c_dirs = 0; w->c_files = 0; w->c_matches = 0;
+}
+
+static void worker_finish(Worker *w) {
+    buf_flush(w);
+    atomic_xadd(&w->s->n_dirs, w->c_dirs);
+    atomic_xadd(&w->s->n_files, w->c_files);
+    atomic_xadd(&w->s->n_matches, w->c_matches);
+}
+
+static i64 worker_main(void *arg) {
+    Scanner *s = (Scanner *)arg;
+    Worker w;
+    worker_init(&w, s);
+
+    worker_loop(s, &w);
+    worker_finish(&w);
+
+    atomic_xadd(&s->workers_exited, 1);
+    syscall6(SYS_futex, (long)&s->workers_exited,
              FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
     return 0;
 }
 
-static i64 spawn_worker(Pool *p) {
-    /* worker_fn's frame is large: rbuf 32K + obuf 16K + batch 33K. */
+static i64 spawn_worker(Scanner *s) {
     i64 stksz = 1048576;
     void *stk = (void *)syscall6(SYS_mmap, 0, (unsigned long)stksz,
-                                  PROT_READ|PROT_WRITE,
-                                  MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                                 PROT_READ|PROT_WRITE,
+                                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (is_mmap_err(stk)) return -1;
 
     u64 sp = (u64)stk + stksz;
     sp &= ~15ULL;
     sp -= 24;
     ((void **)(u64)sp)[0] = (void *)clone_trampoline;
-    ((void **)(u64)sp)[1] = p;
-    ((void **)(u64)sp)[2] = (void *)worker_fn;
+    ((void **)(u64)sp)[1] = s;
+    ((void **)(u64)sp)[2] = (void *)worker_main;
 
     long flags = CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|
                  CLONE_THREAD|CLONE_SETTLS|CLONE_PARENT_SETTID|
@@ -379,31 +397,44 @@ static i64 spawn_worker(Pool *p) {
     return 0;
 }
 
-void pool_spawn(Pool *p, const char *needle, i64 nlen) {
-    g_needle = needle;
-    g_nlen = nlen;
+i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
+    s->cfg = cfg;
+    s->head = 0; s->tail = 0;
+    s->active = 0; s->done = 0; s->work_gen = 0; s->idle = 0;
+    s->n_dirs = 0; s->n_files = 0; s->n_matches = 0;
+    s->workers_live = 0; s->workers_exited = 0;
     g_out_lock = 0;
 
-    for (i64 i = 0; i < p->num_workers; i++) {
-        if (spawn_worker(p) == 0) atomic_xadd(&p->workers_live, 1);
-    }
-}
+    for (i64 i = 0; i < SCAN_QUEUE_CAP; i++) s->q[i].seq = i;
 
-void pool_flush(Pool *p) {
-    atomic_store(&p->done, 1);
+    if (bump_init(&s->arena, ARENA_CAP) < 0) return 0;
 
-    /* Wait for every worker to drain its private output buffer and exit.
-       Waiting on pending==0 alone is not enough: a worker decrements pending
-       while the matching path is still sitting in its 16K obuf, and returning
-       here lets main exit_group() and kill it before the flush. */
-    i64 live = atomic_load(&p->workers_live);
-    for (;;) {
-        /* Re-broadcast: a worker may sample head, then have done set, then
-           enter FUTEX_WAIT after our first wake -- that wake would be lost. */
-        syscall6(SYS_futex, (long)&p->head,
-                 FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
+    if (!root || !root[0]) root = ".";
+    i64 rl = str_len(root);
+    char *rp = (char *)bump_alloc(&s->arena, rl + 1);
+    if (!rp) return 0;
+    for (i64 i = 0; i <= rl; i++) rp[i] = root[i];
 
-        if (atomic_load(&p->workers_exited) >= live) break;
+    DirRef r;
+    r.path = rp; r.len = (i32)rl; r.depth = 0; r.ign = 0;
+    atomic_xadd(&s->active, 1);
+    if (!q_push(s, &r)) return 0;
+
+    for (i64 i = 1; i < cfg->num_workers; i++)
+        if (spawn_worker(s) == 0) atomic_xadd(&s->workers_live, 1);
+
+    Worker w;
+    worker_init(&w, s);
+    worker_loop(s, &w);
+    worker_finish(&w);
+
+    i64 live = atomic_load(&s->workers_live);
+    while (atomic_load(&s->workers_exited) < live) {
+        atomic_store(&s->done, 1);
+        atomic_xadd(&s->work_gen, 1);
+        wake_all(s);
         syscall1(SYS_sched_yield, 0);
     }
+
+    return atomic_load(&s->n_matches);
 }

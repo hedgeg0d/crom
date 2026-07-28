@@ -22,10 +22,6 @@
 
 #define IORING_REGISTER_FILES 2
 
-/* Tail of the SQE past user_data. file_index is what turns OPENAT into a
-   direct-descriptor open (slot+1), which is the only way a linked READ can
-   address the fd the OPENAT produced -- io_uring does not propagate plain
-   fds between links. */
 struct iouring_sqe {
     u8  opcode;
     u8  flags;

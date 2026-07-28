@@ -3,44 +3,60 @@
 
 #include "types.h"
 #include "arena.h"
+#include "ignore.h"
 
-#define POOL_QUEUE_CAP 1024
-#define POOL_PATH_SZ   1024
+#define SCAN_QUEUE_CAP 8192
 
-/* Slot generation counter, Vyukov-style bounded queue.
-   seq == h        -> slot is free, producer may fill generation h
-   seq == h + 1    -> slot holds published data for consumer h
-   seq == h + CAP  -> consumer copied the data out, slot free again
-   Without this handshake the producer reuses a slot as soon as `tail`
-   moves, while the consumer is still reading the path out of it. */
 typedef struct {
-    char path[POOL_PATH_SZ];
-    i64 len;
-    u8 dtype;
+    const char *path;      /* arena-owned, NUL-terminated */
+    i32 len;
+    i32 depth;
+    const GitNode *ign;
+} DirRef;
+
+typedef struct {
+    DirRef d;
     volatile i64 seq;
-} PoolItem;
+} ScanSlot;
 
 typedef struct {
-    PoolItem items[POOL_QUEUE_CAP];
+    const char *pattern;      /* name glob, or 0 */
+    const char *needle;       /* content substring, or 0 */
+    i64 needle_len;
+    const char *exec_cmd;     /* -e, or 0 */
+    i64 type_filter;          /* 0 | 'f' | 'd' | 'l' */
+    i64 size_cmp;             /* -1 lt, 0 off, 1 gt */
+    i64 size_val;
+    i64 max_depth;            /* -1 = unlimited */
+    i64 json_out;
+    i64 use_ignore;
+    i64 bar;
+    i64 num_workers;
+} ScanCfg;
+
+typedef struct {
+    const ScanCfg *cfg;
+    Bump arena;
+
+    ScanSlot q[SCAN_QUEUE_CAP];
     volatile i64 head;
     volatile i64 tail;
+
+    volatile i64 active;      /* dirs discovered but not yet finished */
     volatile i64 done;
-    volatile i64 pending;
-    volatile i64 waiters;
-    volatile i64 matches;
+    volatile i64 work_gen;    /* bumped on every publish, futex address */
+    volatile i64 idle;
+
+    volatile i64 n_dirs;
+    volatile i64 n_files;
+    volatile i64 n_matches;
+
     volatile i64 workers_live;
     volatile i64 workers_exited;
-    i64 num_workers;
-    i64 json_out;
-} Pool;
+} Scanner;
 
-void pool_init(Pool *p, i64 workers);
-void pool_spawn(Pool *p, const char *needle, i64 nlen);
-i64  pool_push(Pool *p, const char *path, i64 len, u8 dtype);
-/* `path` is a caller-owned buffer of at least POOL_PATH_SZ bytes; the payload
-   is copied into it so the caller may hold it past the slot's lifetime. */
-i64  pool_pop(Pool *p, char *path, i64 *len, u8 *dtype);
-i64  pool_try_pop(Pool *p, char *path, i64 *len, u8 *dtype);
-void pool_flush(Pool *p);
+/* Runs the whole traversal; the calling thread participates as a worker.
+   Returns the number of matches. */
+i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root);
 
 #endif

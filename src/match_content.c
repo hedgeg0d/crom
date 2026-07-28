@@ -11,14 +11,25 @@
 
 #define BM_THRESH 8
 
-static void bm_build_bc(const u8 *n, i64 nl, i64 *bc) {
-    for (i64 i = 0; i < 256; i++) bc[i] = nl;
-    for (i64 i = 0; i < nl - 1; i++) bc[n[i]] = nl - 1 - i;
+static i32 g_bc[256];
+static i64 g_bc_ready;
+
+void content_prepare(const char *needle, i64 nlen) {
+    if (nlen < BM_THRESH) return;
+    const u8 *n = (const u8 *)needle;
+    for (i64 i = 0; i < 256; i++) g_bc[i] = (i32)nlen;
+    for (i64 i = 0; i < nlen - 1; i++) g_bc[n[i]] = (i32)(nlen - 1 - i);
+    g_bc_ready = 1;
 }
 
 static i64 bm_search(const u8 *data, i64 len, const u8 *n, i64 nl) {
-    i64 bc[256];
-    bm_build_bc(n, nl, bc);
+    i32 local[256];
+    const i32 *bc = g_bc;
+    if (!g_bc_ready) {
+        for (i64 i = 0; i < 256; i++) local[i] = (i32)nl;
+        for (i64 i = 0; i < nl - 1; i++) local[n[i]] = (i32)(nl - 1 - i);
+        bc = local;
+    }
 
     i64 i = nl - 1;
     while (i < len) {
@@ -104,37 +115,55 @@ i64 content_search(const u8 *data, i64 len, const char *needle, i64 nlen) {
     return simd_search(data, len, needle, nlen);
 }
 
+static i64 g_skip_binary = 1;
+
+void content_set_text_only(i64 on) { g_skip_binary = on; }
+
+#define BIN_PROBE 4096
+
+static i64 looks_binary(const u8 *p, i64 n) {
+    if (n > BIN_PROBE) n = BIN_PROBE;
+    for (i64 i = 0; i < n; i++) if (p[i] == 0) return 1;
+    return 0;
+}
+
+static i64 search_open_fd(i64 fd, const char *needle, i64 nlen,
+                          u8 *rbuf, i64 rbuf_sz) {
+    i64 carry = 0;
+    i64 first = 1;
+    for (;;) {
+        i64 want = rbuf_sz - carry;
+        i64 n = syscall3(SYS_read, fd, (long)(rbuf + carry), (unsigned long)want);
+        if (n <= 0) return 0;
+
+        if (first) {
+            first = 0;
+            if (g_skip_binary && looks_binary(rbuf, n)) return 0;
+        }
+
+        i64 avail = carry + n;
+        if (content_search(rbuf, avail, needle, nlen)) return 1;
+        if (n < want) return 0;                 /* short read == EOF */
+
+        carry = nlen - 1;
+        if (carry > avail) carry = avail;
+        for (i64 i = 0; i < carry; i++) rbuf[i] = rbuf[avail - carry + i];
+    }
+}
+
 i64 search_file(const char *path, const char *needle, i64 nlen, u8 *rbuf, i64 rbuf_sz) {
     i64 fd = syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
     if (fd < 0) return 0;
-
-    struct stat64 st;
-    if (syscall2(SYS_fstat, fd, (long)&st) < 0) {
-        syscall1(SYS_close, fd);
-        return 0;
-    }
-
-    i64 size = st.st_size;
-    if (size < nlen) { syscall1(SYS_close, fd); return 0; }
-
-    if ((u64)size > (u64)rbuf_sz) {
-        void *data = (void *)syscall6(SYS_mmap, 0, (unsigned long)size,
-                                       PROT_READ, MAP_PRIVATE, fd, 0);
-        if (is_mmap_err(data)) { syscall1(SYS_close, fd); return 0; }
-        i64 found = content_search((const u8 *)data, size, needle, nlen);
-        syscall2(SYS_munmap, (long)data, (unsigned long)size);
-        syscall1(SYS_close, fd);
-        return found;
-    }
-
-    i64 total = 0;
-    while (total < size) {
-        i64 n = syscall4(SYS_pread64, fd, (long)(rbuf + total),
-                         (unsigned long)(size - total), total);
-        if (n <= 0) { syscall1(SYS_close, fd); return 0; }
-        total += n;
-    }
-
+    i64 found = search_open_fd(fd, needle, nlen, rbuf, rbuf_sz);
     syscall1(SYS_close, fd);
-    return content_search(rbuf, size, needle, nlen);
+    return found;
+}
+
+i64 search_file_at(i64 dirfd, const char *name, const char *needle, i64 nlen,
+                   u8 *rbuf, i64 rbuf_sz) {
+    i64 fd = syscall3(SYS_openat, dirfd, (long)name, O_RDONLY|O_CLOEXEC);
+    if (fd < 0) return 0;
+    i64 found = search_open_fd(fd, needle, nlen, rbuf, rbuf_sz);
+    syscall1(SYS_close, fd);
+    return found;
 }
