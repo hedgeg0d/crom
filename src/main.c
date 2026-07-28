@@ -23,7 +23,17 @@ static i64 g_size_val;
 static i64 g_max_depth = -1;
 static i64 g_json;
 static i64 g_null_sep;
-static i64 g_color = 1;
+static i64 g_want_help;
+static i64 g_want_version;
+static i64 g_color = 1;          /* 0 never, 1 auto, 2 always */
+
+/* Resolved per stream: help goes to stdout, the bar and summary to stderr,
+   and either can be a terminal while the other is a pipe. */
+static i64 color_on(i64 fd) {
+    if (g_color == 0) return 0;
+    if (g_color >= 2) return 1;
+    return is_tty(fd);
+}
 static i64 g_binary;
 static const char *g_exec_cmd;
 
@@ -31,24 +41,26 @@ static const char *target;
 static i32 saw_dash;
 
 static void usage(void) {
-    write_str(STDOUT_FILENO, "\033[1;36mcrom\033[0m — fast file hunter\n\n");
-    write_str(STDOUT_FILENO, "  \033[1mcrom\033[0m [pattern] [path]\n\n");
-    write_str(STDOUT_FILENO, "  \033[33m-n\033[0m, \033[33m--name\033[0m <glob>     filename pattern\n");
-    write_str(STDOUT_FILENO, "  \033[33m-c\033[0m, \033[33m--content\033[0m <t>    search contents\n");
-    write_str(STDOUT_FILENO, "  \033[33m-t\033[0m, \033[33m--type\033[0m <f|d|l>   filter by type\n");
-    write_str(STDOUT_FILENO, "  \033[33m-s\033[0m, \033[33m--size\033[0m <[+-]N>   filter by size\n");
-    write_str(STDOUT_FILENO, "  \033[33m--depth\033[0m <N>         max recursion depth\n");
-    write_str(STDOUT_FILENO, "  \033[33m-e\033[0m, \033[33m--exec\033[0m <cmd> {}  run command per result\n");
-    write_str(STDOUT_FILENO, "  \033[33m-j\033[0m, \033[33m--threads\033[0m <N>   worker threads\n");
-    write_str(STDOUT_FILENO, "  \033[33m-a\033[0m, \033[33m--text\033[0m          search binary files\n");
-    write_str(STDOUT_FILENO, "  \033[33m-0\033[0m, \033[33m--null\033[0m          null-separated output\n");
-    write_str(STDOUT_FILENO, "  \033[33m--json\033[0m             JSON output\n");
-    write_str(STDOUT_FILENO, "  \033[33m--bar\033[0m              progress bar\n");
-    write_str(STDOUT_FILENO, "  \033[33m--no-ignore\033[0m         skip .gitignore\n");
-    write_str(STDOUT_FILENO, "  \033[33m--no-config\033[0m         skip config file\n");
-    write_str(STDOUT_FILENO, "  \033[33m--color\033[0m auto|never\n");
-    write_str(STDOUT_FILENO, "  \033[33m-h\033[0m, \033[33m--help\033[0m          show help\n");
-    write_str(STDOUT_FILENO, "  \033[33m-V\033[0m, \033[33m--version\033[0m       print version\n");
+    i64 c = color_on(STDOUT_FILENO);
+    write_str_c(STDOUT_FILENO, "\033[1;36mcrom\033[0m — fast file hunter\n\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[1mcrom\033[0m [pattern] [path]\n\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-n\033[0m, \033[33m--name\033[0m <glob>     filename pattern\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-c\033[0m, \033[33m--content\033[0m <t>    search contents\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-t\033[0m, \033[33m--type\033[0m <f|d|l>   filter by type\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-s\033[0m, \033[33m--size\033[0m <[+-]N>   filter by size\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--depth\033[0m <N>         max recursion depth\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-e\033[0m, \033[33m--exec\033[0m <cmd> {}  run command per result\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-j\033[0m, \033[33m--threads\033[0m <N>   worker threads\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-a\033[0m, \033[33m--text\033[0m          search binary files\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-0\033[0m, \033[33m--null\033[0m          null-separated output\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--json\033[0m             JSON output\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--bar\033[0m              progress bar\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--no-ignore\033[0m         skip .gitignore\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--no-config\033[0m         skip config file\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--color\033[0m <when>      auto|always|never\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-h\033[0m, \033[33m--help\033[0m          show help\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-V\033[0m, \033[33m--version\033[0m       print version\n", c);
+    write_str_c(STDOUT_FILENO, "\n  \033[1mexit\033[0m  \033[32m0\033[0m found  \033[32m1\033[0m none  \033[32m2\033[0m error\n", c);
 }
 
 static i64 parse_int(const char *s) {
@@ -141,9 +153,9 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
         *pi = i; return;
     }
 
-    if (str_eq(arg, "-h") || str_eq(arg, "--help")) { usage(); *pi = i; return; }
+    if (str_eq(arg, "-h") || str_eq(arg, "--help")) { g_want_help = 1; *pi = i; return; }
     if (str_eq(arg, "-V") || str_eq(arg, "--version")) {
-        write_str(STDOUT_FILENO, "crom 0.2.0\n"); *pi = i; return;
+        g_want_version = 1; *pi = i; return;
     }
     if (str_eq(arg, "-n") || str_eq(arg, "--name")) {
         if (i + 1 < ac) pattern = av[++i]; *pi = i; return;
@@ -219,13 +231,16 @@ int crom_main(int argc, char **argv, char **envp) {
     for (int i = 1; i < argc; i++)
         parse_arg(argv[i], argc, argv, &i);
 
+    if (g_want_help)    { usage(); return 0; }
+    if (g_want_version) { write_str(STDOUT_FILENO, "crom 0.2.0\n"); return 0; }
+
     if (!target) target = ".";
     if (!pattern && !needle) pattern = "*";
     if (num_threads <= 0) num_threads = nproc();
     if (num_threads > SCAN_MAX_WORKERS) num_threads = SCAN_MAX_WORKERS;
     if (g_size_cmp == 0 && g_size_val > 0) g_size_cmp = 1;
 
-    if (g_bar) g_bar = display_init();   /* no bar unless stderr is a tty */
+    if (g_bar) g_bar = display_init(color_on(STDERR_FILENO));
     ignore_set_enabled(g_use_ignore);
     if (needle) content_prepare(needle, needle_len);
     content_set_text_only(!g_binary);
@@ -240,15 +255,32 @@ int crom_main(int argc, char **argv, char **envp) {
     cfg.size_val    = g_size_val;
     cfg.max_depth   = g_max_depth;
     cfg.json_out    = g_json;
+    cfg.null_sep    = g_null_sep;
     cfg.use_ignore  = g_use_ignore;
     cfg.bar         = g_bar;
     cfg.tty_out     = is_tty(STDOUT_FILENO);
     cfg.num_workers = num_threads;
+
+    i64 rfd = syscall3(SYS_openat, AT_FDCWD, (long)target,
+                       O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (rfd < 0) {
+        write_str(STDERR_FILENO, prog);
+        write_str(STDERR_FILENO, ": cannot open '");
+        write_str(STDERR_FILENO, target);
+        write_str(STDERR_FILENO, "'\n");
+        return 2;
+    }
+    syscall1(SYS_close, rfd);
 
     g_matches = scan_run(&scanner, &cfg, target);
 
     if (g_bar)
         display_done(scanner.n_dirs, scanner.n_files, g_matches, 0);
 
-    return 0;
+    if (scanner.err) {
+        write_str(STDERR_FILENO, prog);
+        write_str(STDERR_FILENO, ": scan failed\n");
+        return 2;
+    }
+    return g_matches > 0 ? 0 : 1;   /* grep convention: 1 == no matches */
 }

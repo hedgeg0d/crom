@@ -35,6 +35,7 @@ typedef struct {
     i64 size_val;
     i64 max_depth;            /* -1 = unlimited */
     i64 json_out;
+    i64 null_sep;  /* -0: terminate records with NUL instead of newline */
     i64 use_ignore;
     i64 bar;
     i64 tty_out;   /* stdout is a terminal -> flush every line */
@@ -64,6 +65,7 @@ typedef struct {
     volatile i64 bar_live;
     volatile i64 bar_exited;
     volatile i64 next_id;
+    volatile i64 err;         /* fatal: no arena, root unreadable */
 } Scanner;
 
 /* Runs the whole traversal; the calling thread participates as a worker.

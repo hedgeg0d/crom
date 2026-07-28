@@ -13,6 +13,7 @@ static const i64 NFRAMES = 10;
 #define SPIN_MS 90
 
 static i64 g_start_ns;
+static i64 g_color;
 static volatile i64 g_drawn;      /* a bar line is currently on screen */
 
 static i64 now_ms(void) {
@@ -48,12 +49,12 @@ static i64 lit(char *b, i64 pos, const char *s) {
     return pos;
 }
 
-i64 display_init(void) {
+i64 display_init(i64 use_color) {
     struct { i64 sec; i64 nsec; } ts;
     syscall2(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&ts);
     g_start_ns = ts.sec * 1000000000L + ts.nsec;
     g_drawn = 0;
-    /* Escape sequences into a pipe or a file are just garbage. */
+    g_color = use_color;
     return is_tty(STDERR_FILENO);
 }
 
@@ -81,6 +82,7 @@ void display_update(i64 dirs, i64 files, i64 matches) {
     pos += fmt_time(buf + pos, ms);
     pos = lit(buf, pos, "\033[K");
 
+    if (!g_color) pos = sgr_strip(buf, pos);
     atomic_store(&g_drawn, 1);
     write_all(STDERR_FILENO, buf, pos);
 }
@@ -101,6 +103,7 @@ void display_done(i64 dirs, i64 files, i64 matches, i64 elapsed_us) {
     pos += fmt_time(buf + pos, ms);
     pos = lit(buf, pos, "\033[0m\n");
 
+    if (!g_color) pos = sgr_strip(buf, pos);
     atomic_store(&g_drawn, 0);
     write_all(STDERR_FILENO, buf, pos);
 }

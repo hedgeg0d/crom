@@ -34,6 +34,29 @@ static inline i64 is_tty(i64 fd) {
     return syscall3(SYS_ioctl, fd, TCGETS, (long)termios_buf) == 0;
 }
 
+static inline i64 sgr_strip(char *b, i64 n) {
+    i64 w = 0;
+    for (i64 r = 0; r < n; ) {
+        if (b[r] == 033 && r + 1 < n && b[r+1] == '[') {
+            i64 q = r + 2;
+            while (q < n && !((b[q] >= 'A' && b[q] <= 'Z') ||
+                              (b[q] >= 'a' && b[q] <= 'z'))) q++;
+            if (q < n && b[q] == 'm') { r = q + 1; continue; }
+        }
+        b[w++] = b[r++];
+    }
+    return w;
+}
+
+static inline i64 write_str_c(i64 fd, const char *s, i64 color) {
+    if (color) return write_str(fd, s);
+    char buf[1024];
+    i64 n = str_len(s);
+    if (n > (i64)sizeof(buf)) return write_str(fd, s);
+    for (i64 i = 0; i < n; i++) buf[i] = s[i];
+    return write_all(fd, buf, sgr_strip(buf, n));
+}
+
 static inline void *crom_memcpy(void *dst, const void *src, i64 n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;

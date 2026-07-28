@@ -152,6 +152,8 @@ static void buf_flush(Worker *w) {
 }
 
 static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
+    const char term = w->s->cfg->null_sep ? '\0' : '\n';
+
     if (json) {
         if (w->olen + 2 * len + 16 > OBUF_SZ) buf_flush(w);
         buf_add(w->obuf, &w->olen, "{\"path\":\"", 9);
@@ -159,11 +161,12 @@ static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
             if (path[i] == '"' || path[i] == '\\') w->obuf[w->olen++] = '\\';
             w->obuf[w->olen++] = path[i];
         }
-        buf_add(w->obuf, &w->olen, "\"}\n", 3);
+        buf_add(w->obuf, &w->olen, "\"}", 2);
+        w->obuf[w->olen++] = term;
     } else {
         if (w->olen + len + 1 > OBUF_SZ) buf_flush(w);
         buf_add(w->obuf, &w->olen, path, len);
-        w->obuf[w->olen++] = '\n';
+        w->obuf[w->olen++] = term;
     }
 
     if (w->s->cfg->tty_out) buf_flush(w);
@@ -439,7 +442,7 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     s->head = 0; s->tail = 0;
     s->active = 0; s->done = 0; s->work_gen = 0; s->idle = 0;
     s->n_dirs = 0; s->n_files = 0; s->n_matches = 0;
-    s->bar_live = 0; s->bar_exited = 0;
+    s->bar_live = 0; s->bar_exited = 0; s->err = 0;
     s->next_id = 1;   /* slot 0 belongs to the calling thread */
     for (i64 i = 0; i < SCAN_MAX_WORKERS; i++) {
         s->wc[i].dirs = 0; s->wc[i].files = 0; s->wc[i].matches = 0;
@@ -449,18 +452,18 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
 
     for (i64 i = 0; i < SCAN_QUEUE_CAP; i++) s->q[i].seq = i;
 
-    if (bump_init(&s->arena, ARENA_CAP) < 0) return 0;
+    if (bump_init(&s->arena, ARENA_CAP) < 0) { s->err = 1; return 0; }
 
     if (!root || !root[0]) root = ".";
     i64 rl = str_len(root);
     char *rp = (char *)bump_alloc(&s->arena, rl + 1);
-    if (!rp) return 0;
+    if (!rp) { s->err = 1; return 0; }
     for (i64 i = 0; i <= rl; i++) rp[i] = root[i];
 
     DirRef r;
     r.path = rp; r.len = (i32)rl; r.depth = 0; r.ign = 0;
     atomic_xadd(&s->active, 1);
-    if (!q_push(s, &r)) return 0;
+    if (!q_push(s, &r)) { s->err = 1; return 0; }
 
     for (i64 i = 1; i < cfg->num_workers; i++)
         if (spawn_thread(worker_main, s) == 0) atomic_xadd(&s->workers_live, 1);
