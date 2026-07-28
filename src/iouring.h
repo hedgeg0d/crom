@@ -12,6 +12,7 @@
 
 #define IORING_OP_OPENAT    18
 #define IORING_OP_CLOSE     19
+#define IORING_OP_OPENAT2   37
 
 #define IOSQE_FIXED_FILE    (1U << 0)
 
