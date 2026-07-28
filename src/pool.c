@@ -42,10 +42,17 @@ typedef struct {
     LBlk *freelist;
     i64 ln;
     i64 olen;
+    WCount *wc;
     i64 c_dirs, c_files, c_matches;
-    char obuf[OBUF_SZ];
-    u8 rbuf[RBUF_SZ];
-} Worker;
+    char obuf[OBUF_SZ] __attribute__((aligned(64)));
+    u8 rbuf[RBUF_SZ] __attribute__((aligned(64)));
+} __attribute__((aligned(64))) Worker;
+
+static void wc_publish(Worker *w) {
+    w->wc->dirs = w->c_dirs;
+    w->wc->files = w->c_files;
+    w->wc->matches = w->c_matches;
+}
 
 static i64 lstk_push(Worker *w, const DirRef *d) {
     if (!w->top || w->ln == LSTK_CHUNK) {
@@ -113,6 +120,14 @@ static void wake_all(Scanner *s) {
              FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
 }
 
+static void scan_finish(Scanner *s) {
+    atomic_store(&s->done, 1);
+    atomic_xadd(&s->work_gen, 1);
+    wake_all(s);
+    syscall6(SYS_futex, (long)&s->done,
+             FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
+}
+
 static void publish(Scanner *s, Worker *w, const DirRef *d) {
     atomic_xadd(&s->active, 1);
     if (q_push(s, d)) {
@@ -130,6 +145,7 @@ static void buf_add(char *buf, i64 *olen, const char *p, i64 plen) {
 static void buf_flush(Worker *w) {
     if (w->olen <= 0) return;
     out_lock();
+    if (w->s->cfg->bar) display_clear();
     write_all(STDOUT_FILENO, w->obuf, w->olen);
     out_unlock();
     w->olen = 0;
@@ -149,6 +165,8 @@ static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
         buf_add(w->obuf, &w->olen, path, len);
         w->obuf[w->olen++] = '\n';
     }
+
+    if (w->s->cfg->tty_out) buf_flush(w);
 }
 
 static void exec_file(const char *cmd, const char *path, i64 len) {
@@ -263,11 +281,6 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
 
             if (is_dir) {
                 w->c_dirs++;
-                if (c->bar && (w->c_dirs & 63) == 0) {
-                    display_update(atomic_load(&s->n_dirs) + w->c_dirs,
-                                   atomic_load(&s->n_files) + w->c_files,
-                                   atomic_load(&s->n_matches) + w->c_matches);
-                }
 
                 i64 cd = d->depth + 1;
                 if (c->max_depth < 0 || cd <= c->max_depth) {
@@ -284,6 +297,7 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
                 }
             } else if (type == DT_REG) {
                 w->c_files++;
+                if ((w->c_files & 511) == 0) wc_publish(w);
             }
 
             consider(s, w, fd, pbuf, flen, name, type);
@@ -299,11 +313,8 @@ static void worker_loop(Scanner *s, Worker *w) {
 
         if (lstk_pop(w, &d) || q_pop(s, &d)) {
             scan_dir(s, w, &d);
-            if (atomic_xadd(&s->active, -1) == 1) {
-                atomic_store(&s->done, 1);
-                atomic_xadd(&s->work_gen, 1);
-                wake_all(s);
-            }
+            wc_publish(w);
+            if (atomic_xadd(&s->active, -1) == 1) scan_finish(s);
             continue;
         }
 
@@ -314,11 +325,8 @@ static void worker_loop(Scanner *s, Worker *w) {
         if (q_pop(s, &d)) {
             atomic_xadd(&s->idle, -1);
             scan_dir(s, w, &d);
-            if (atomic_xadd(&s->active, -1) == 1) {
-                atomic_store(&s->done, 1);
-                atomic_xadd(&s->work_gen, 1);
-                wake_all(s);
-            }
+            wc_publish(w);
+            if (atomic_xadd(&s->active, -1) == 1) scan_finish(s);
             continue;
         }
         if (!atomic_load(&s->done) && atomic_load(&s->work_gen) == gen)
@@ -328,25 +336,21 @@ static void worker_loop(Scanner *s, Worker *w) {
     }
 }
 
-static void worker_init(Worker *w, Scanner *s) {
+static void worker_init(Worker *w, Scanner *s, i64 id) {
     w->s = s; w->top = 0; w->freelist = 0; w->ln = 0; w->olen = 0;
+    w->wc = &s->wc[id];
     w->c_dirs = 0; w->c_files = 0; w->c_matches = 0;
 }
 
-static void worker_finish(Worker *w) {
-    buf_flush(w);
-    atomic_xadd(&w->s->n_dirs, w->c_dirs);
-    atomic_xadd(&w->s->n_files, w->c_files);
-    atomic_xadd(&w->s->n_matches, w->c_matches);
-}
 
 static i64 worker_main(void *arg) {
     Scanner *s = (Scanner *)arg;
     Worker w;
-    worker_init(&w, s);
+    worker_init(&w, s, atomic_xadd(&s->next_id, 1));
 
     worker_loop(s, &w);
-    worker_finish(&w);
+    wc_publish(&w);
+    buf_flush(&w);
 
     atomic_xadd(&s->workers_exited, 1);
     syscall6(SYS_futex, (long)&s->workers_exited,
@@ -354,7 +358,40 @@ static i64 worker_main(void *arg) {
     return 0;
 }
 
-static i64 spawn_worker(Scanner *s) {
+static i64 bar_main(void *arg) {
+    Scanner *s = (Scanner *)arg;
+    i64 delay_ns = 250000000L;
+
+    for (;;) {
+        struct { i64 sec; i64 nsec; } ts;
+        ts.sec  = delay_ns / 1000000000L;
+        ts.nsec = delay_ns % 1000000000L;
+        syscall6(SYS_futex, (long)&s->done,
+                 FUTEX_WAIT|FUTEX_PRIVATE_FLAG, 0, (long)&ts, 0, 0);
+
+        if (atomic_load(&s->done)) break;
+        delay_ns = 66000000L;
+
+        i64 d = 0, f = 0, m = 0;
+        for (i64 i = 0; i < s->cfg->num_workers; i++) {
+            d += s->wc[i].dirs; f += s->wc[i].files; m += s->wc[i].matches;
+        }
+        out_lock();
+        display_update(d, f, m);
+        out_unlock();
+    }
+
+    out_lock();
+    display_clear();
+    out_unlock();
+
+    atomic_xadd(&s->bar_exited, 1);
+    syscall6(SYS_futex, (long)&s->bar_exited,
+             FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
+    return 0;
+}
+
+static i64 spawn_thread(i64 (*fn)(void *), void *arg) {
     i64 stksz = 1048576;
     void *stk = (void *)syscall6(SYS_mmap, 0, (unsigned long)stksz,
                                  PROT_READ|PROT_WRITE,
@@ -365,8 +402,8 @@ static i64 spawn_worker(Scanner *s) {
     sp &= ~15ULL;
     sp -= 24;
     ((void **)(u64)sp)[0] = (void *)clone_trampoline;
-    ((void **)(u64)sp)[1] = s;
-    ((void **)(u64)sp)[2] = (void *)worker_main;
+    ((void **)(u64)sp)[1] = arg;
+    ((void **)(u64)sp)[2] = (void *)fn;
 
     long flags = CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|
                  CLONE_THREAD|CLONE_SETTLS|CLONE_PARENT_SETTID|
@@ -402,6 +439,11 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     s->head = 0; s->tail = 0;
     s->active = 0; s->done = 0; s->work_gen = 0; s->idle = 0;
     s->n_dirs = 0; s->n_files = 0; s->n_matches = 0;
+    s->bar_live = 0; s->bar_exited = 0;
+    s->next_id = 1;   /* slot 0 belongs to the calling thread */
+    for (i64 i = 0; i < SCAN_MAX_WORKERS; i++) {
+        s->wc[i].dirs = 0; s->wc[i].files = 0; s->wc[i].matches = 0;
+    }
     s->workers_live = 0; s->workers_exited = 0;
     g_out_lock = 0;
 
@@ -421,20 +463,31 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     if (!q_push(s, &r)) return 0;
 
     for (i64 i = 1; i < cfg->num_workers; i++)
-        if (spawn_worker(s) == 0) atomic_xadd(&s->workers_live, 1);
+        if (spawn_thread(worker_main, s) == 0) atomic_xadd(&s->workers_live, 1);
+
+    if (cfg->bar && spawn_thread(bar_main, s) == 0)
+        atomic_xadd(&s->bar_live, 1);
 
     Worker w;
-    worker_init(&w, s);
+    worker_init(&w, s, 0);
     worker_loop(s, &w);
-    worker_finish(&w);
+    wc_publish(&w);
+    buf_flush(&w);
 
     i64 live = atomic_load(&s->workers_live);
     while (atomic_load(&s->workers_exited) < live) {
-        atomic_store(&s->done, 1);
-        atomic_xadd(&s->work_gen, 1);
-        wake_all(s);
+        scan_finish(s);
         syscall1(SYS_sched_yield, 0);
     }
 
-    return atomic_load(&s->n_matches);
+    /* Bar thread must be gone before main draws the summary line. */
+    while (atomic_load(&s->bar_exited) < atomic_load(&s->bar_live))
+        syscall1(SYS_sched_yield, 0);
+
+    for (i64 i = 0; i < cfg->num_workers; i++) {
+        s->n_dirs += s->wc[i].dirs;
+        s->n_files += s->wc[i].files;
+        s->n_matches += s->wc[i].matches;
+    }
+    return s->n_matches;
 }

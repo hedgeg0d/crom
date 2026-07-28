@@ -1,6 +1,7 @@
 #include "display.h"
 #include "syscalls.h"
 #include "util.h"
+#include "atomics.h"
 
 static const char *FRAMES[] = {
     "\xe2\xa0\x8b", "\xe2\xa0\x99", "\xe2\xa0\xb9", "\xe2\xa0\xb8",
@@ -9,133 +10,97 @@ static const char *FRAMES[] = {
 };
 static const i64 NFRAMES = 10;
 
-static i64 g_start_ns;
-static volatile i64 g_last_update;
+#define SPIN_MS 90
 
-static i64 fmt_num(char *b, i64 n) {
-    char t[32];
-    if (n == 0) { b[0] = '0'; return 1; }
+static i64 g_start_ns;
+static volatile i64 g_drawn;      /* a bar line is currently on screen */
+
+static i64 now_ms(void) {
+    struct { i64 sec; i64 nsec; } ts;
+    syscall2(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&ts);
+    return (ts.sec * 1000000000L + ts.nsec - g_start_ns) / 1000000;
+}
+
+static i64 fmt_pad(char *b, i64 n, i64 width) {
+    char t[24];
     i64 i = 0;
+    if (n <= 0) t[i++] = '0';
     while (n > 0) { t[i++] = '0' + (char)(n % 10); n /= 10; }
-    for (i64 j = 0; j < i; j++) b[j] = t[i - 1 - j];
-    return i;
+    i64 pos = 0;
+    for (i64 p = width - i; p > 0; p--) b[pos++] = ' ';
+    while (i > 0) b[pos++] = t[--i];
+    return pos;
 }
 
 static i64 fmt_time(char *b, i64 ms) {
     i64 sec = ms / 1000;
     i64 min = sec / 60;
     sec %= 60;
-    i64 pos = 0;
-    if (min < 10) { b[pos++] = ' '; pos += fmt_num(b + pos, min); }
-    else pos += fmt_num(b + pos, min);
+    i64 pos = fmt_pad(b, min, 2);
     b[pos++] = ':';
-    if (sec < 10) b[pos++] = '0';
-    pos += fmt_num(b + pos, sec);
+    b[pos++] = '0' + (char)(sec / 10);
+    b[pos++] = '0' + (char)(sec % 10);
     return pos;
 }
 
-void display_init(void) {
+static i64 lit(char *b, i64 pos, const char *s) {
+    while (*s) b[pos++] = *s++;
+    return pos;
+}
+
+i64 display_init(void) {
     struct { i64 sec; i64 nsec; } ts;
     syscall2(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&ts);
     g_start_ns = ts.sec * 1000000000L + ts.nsec;
-    g_last_update = 0;
+    g_drawn = 0;
+    /* Escape sequences into a pipe or a file are just garbage. */
+    return is_tty(STDERR_FILENO);
+}
+
+void display_clear(void) {
+    if (!atomic_load(&g_drawn)) return;
+    atomic_store(&g_drawn, 0);
+    write_all(STDERR_FILENO, "\r\033[K", 4);
 }
 
 void display_update(i64 dirs, i64 files, i64 matches) {
-    struct { i64 sec; i64 nsec; } ts;
-    syscall2(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&ts);
-    i64 now_ns = ts.sec * 1000000000L + ts.nsec;
-    i64 elapsed_ms = (now_ns - g_start_ns) / 1000000;
-
-    i64 frame = ((unsigned long)files * 37) % NFRAMES;
-
-    char buf[128];
+    i64 ms = now_ms();
+    char buf[256];
     i64 pos = 0;
 
-    buf[pos++] = '\r';
-    buf[pos++] = '\033';
-    buf[pos++] = '[';
-    buf[pos++] = 'K';
-    buf[pos++] = ' ';
+    pos = lit(buf, pos, "\r\033[36m ");
+    pos = lit(buf, pos, FRAMES[(ms / SPIN_MS) % NFRAMES]);
+    pos = lit(buf, pos, "\033[0m  ");
 
-    pos += fmt_num(buf + pos, dirs);
-    buf[pos++] = 'd';
-    buf[pos++] = ' ';
-    pos += fmt_num(buf + pos, files);
-    buf[pos++] = 'f';
-    buf[pos++] = ' ';
+    pos += fmt_pad(buf + pos, dirs, 6);
+    pos = lit(buf, pos, "\033[2m dirs\033[0m  ");
+    pos += fmt_pad(buf + pos, files, 7);
+    pos = lit(buf, pos, "\033[2m files\033[0m  ");
+    pos += fmt_pad(buf + pos, matches, 6);
+    pos = lit(buf, pos, "\033[2m matches\033[0m  ");
+    pos += fmt_time(buf + pos, ms);
+    pos = lit(buf, pos, "\033[K");
 
-    if (matches > 0) {
-        pos += fmt_num(buf + pos, matches);
-        buf[pos++] = 'm';
-        buf[pos++] = ' ';
-    }
-
-    pos += fmt_time(buf + pos, elapsed_ms);
-    buf[pos++] = ' ';
-
-    const char *sp = FRAMES[frame];
-    for (i64 i = 0; sp[i]; i++) buf[pos++] = sp[i];
-
+    atomic_store(&g_drawn, 1);
     write_all(STDERR_FILENO, buf, pos);
 }
 
 void display_done(i64 dirs, i64 files, i64 matches, i64 elapsed_us) {
     (void)elapsed_us;
+    i64 ms = now_ms();
 
-    struct { i64 sec; i64 nsec; } ts;
-    syscall2(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&ts);
-    i64 now_ns = ts.sec * 1000000000L + ts.nsec;
-    i64 ms = (now_ns - g_start_ns) / 1000000;
-
-    char buf[160];
+    char buf[256];
     i64 pos = 0;
-    buf[pos++] = '\r';
-    buf[pos++] = '\033';
-    buf[pos++] = '[';
-    buf[pos++] = 'K';
-    buf[pos++] = '\033';
-    buf[pos++] = '[';
-    buf[pos++] = '1';
-    buf[pos++] = ';';
-    buf[pos++] = '3';
-    buf[pos++] = '2';
-    buf[pos++] = 'm';
-
-    pos += fmt_num(buf + pos, dirs);
-    buf[pos++] = ' ';
-    buf[pos++] = 'd';
-    buf[pos++] = 'i';
-    buf[pos++] = 'r';
-    buf[pos++] = 's';
-    buf[pos++] = ' ';
-
-    pos += fmt_num(buf + pos, files);
-    buf[pos++] = ' ';
-    buf[pos++] = 'f';
-    buf[pos++] = 'i';
-    buf[pos++] = 'l';
-    buf[pos++] = 'e';
-    buf[pos++] = 's';
-    buf[pos++] = ' ';
-
-    pos += fmt_num(buf + pos, matches);
-    buf[pos++] = ' ';
-    buf[pos++] = 'm';
-    buf[pos++] = 'a';
-    buf[pos++] = 't';
-    buf[pos++] = 'c';
-    buf[pos++] = 'h';
-    buf[pos++] = 'e';
-    buf[pos++] = 's';
-    buf[pos++] = ' ';
-
-    buf[pos++] = '\033';
-    buf[pos++] = '[';
-    buf[pos++] = '0';
-    buf[pos++] = 'm';
+    pos = lit(buf, pos, "\r\033[K\033[1;32m");
+    pos += fmt_pad(buf + pos, dirs, 1);
+    pos = lit(buf, pos, "\033[0m dirs  \033[1;32m");
+    pos += fmt_pad(buf + pos, files, 1);
+    pos = lit(buf, pos, "\033[0m files  \033[1;32m");
+    pos += fmt_pad(buf + pos, matches, 1);
+    pos = lit(buf, pos, "\033[0m matches  \033[2m");
     pos += fmt_time(buf + pos, ms);
+    pos = lit(buf, pos, "\033[0m\n");
 
-    buf[pos++] = '\n';
+    atomic_store(&g_drawn, 0);
     write_all(STDERR_FILENO, buf, pos);
 }

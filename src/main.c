@@ -222,9 +222,10 @@ int crom_main(int argc, char **argv, char **envp) {
     if (!target) target = ".";
     if (!pattern && !needle) pattern = "*";
     if (num_threads <= 0) num_threads = nproc();
+    if (num_threads > SCAN_MAX_WORKERS) num_threads = SCAN_MAX_WORKERS;
     if (g_size_cmp == 0 && g_size_val > 0) g_size_cmp = 1;
 
-    if (g_bar) display_init();
+    if (g_bar) g_bar = display_init();   /* no bar unless stderr is a tty */
     ignore_set_enabled(g_use_ignore);
     if (needle) content_prepare(needle, needle_len);
     content_set_text_only(!g_binary);
@@ -241,6 +242,7 @@ int crom_main(int argc, char **argv, char **envp) {
     cfg.json_out    = g_json;
     cfg.use_ignore  = g_use_ignore;
     cfg.bar         = g_bar;
+    cfg.tty_out     = is_tty(STDOUT_FILENO);
     cfg.num_workers = num_threads;
 
     g_matches = scan_run(&scanner, &cfg, target);

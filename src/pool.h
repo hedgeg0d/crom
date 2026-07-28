@@ -6,6 +6,12 @@
 #include "ignore.h"
 
 #define SCAN_QUEUE_CAP 8192
+#define SCAN_MAX_WORKERS 256
+
+typedef struct {
+    volatile i64 dirs, files, matches;
+    i64 _pad[5];
+} __attribute__((aligned(64))) WCount;
 
 typedef struct {
     const char *path;      /* arena-owned, NUL-terminated */
@@ -31,12 +37,14 @@ typedef struct {
     i64 json_out;
     i64 use_ignore;
     i64 bar;
+    i64 tty_out;   /* stdout is a terminal -> flush every line */
     i64 num_workers;
 } ScanCfg;
 
 typedef struct {
     const ScanCfg *cfg;
     Bump arena;
+    WCount wc[SCAN_MAX_WORKERS];
 
     ScanSlot q[SCAN_QUEUE_CAP];
     volatile i64 head;
@@ -53,6 +61,9 @@ typedef struct {
 
     volatile i64 workers_live;
     volatile i64 workers_exited;
+    volatile i64 bar_live;
+    volatile i64 bar_exited;
+    volatile i64 next_id;
 } Scanner;
 
 /* Runs the whole traversal; the calling thread participates as a worker.

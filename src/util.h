@@ -29,6 +29,11 @@ static inline i64 write_str(i64 fd, const char *s) {
     return write_all(fd, s, str_len(s));
 }
 
+static inline i64 is_tty(i64 fd) {
+    char termios_buf[64];
+    return syscall3(SYS_ioctl, fd, TCGETS, (long)termios_buf) == 0;
+}
+
 static inline void *crom_memcpy(void *dst, const void *src, i64 n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
