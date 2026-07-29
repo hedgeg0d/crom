@@ -408,15 +408,13 @@ int crom_main(int argc, char **argv, char **envp) {
     }
 
     /* Whole subtrees missing: say so rather than look complete. */
-    if (scanner.err & (ERR_ARENA|ERR_TOOLONG|ERR_EXEC|ERR_FOLLOW)) {
+    if (scanner.err & (ERR_ARENA|ERR_TOOLONG|ERR_EXEC)) {
         if (!g_quiet_errs) {
             write_str(STDERR_FILENO, prog);
             if (scanner.err & ERR_ARENA)
                 write_str(STDERR_FILENO, ": ran out of path memory");
             else if (scanner.err & ERR_TOOLONG)
                 write_str(STDERR_FILENO, ": some paths exceeded the length limit");
-            else if (scanner.err & ERR_FOLLOW)
-                write_str(STDERR_FILENO, ": too many symlinked directories to track");
             else
                 write_str(STDERR_FILENO, ": some -e commands were too long to run");
             write_str(STDERR_FILENO, "; results are incomplete\n");

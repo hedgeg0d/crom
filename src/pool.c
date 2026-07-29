@@ -220,31 +220,7 @@ static u8 resolve_type(i64 dirfd, const char *name) {
     return DT_UNKNOWN;
 }
 
-/* -L only: a cycle must pass through a symlink, so refusing to enter the same
-   link target twice is enough to terminate. Open addressing, ino 0 == empty. */
-static i64 seen_add(Scanner *s, u64 dev, u64 ino) {
-    u64 h = (dev * 1099511628211ULL) ^ (ino * 1469598103934665603ULL);
-    while (atomic_cas(&s->seen_lock, 0, 1) != 0) syscall1(SYS_sched_yield, 0);
-
-    i64 fresh = -1;                 /* -1: table full */
-    if (s->seen_n < SCAN_SEEN_CAP) {
-        fresh = 0;
-        for (i64 k = 0; k < SCAN_SEEN_CAP; k++) {
-            i64 i = (i64)((h + (u64)k) & (SCAN_SEEN_CAP - 1));
-            if (s->seen[i].ino == 0) {
-                s->seen[i].dev = dev; s->seen[i].ino = ino;
-                s->seen_n++;
-                fresh = 1;
-                break;
-            }
-            if (s->seen[i].ino == ino && s->seen[i].dev == dev) break;
-        }
-    }
-    atomic_store(&s->seen_lock, 0);
-    return fresh;
-}
-
-/* Type of what a symlink points at, plus its identity for the cycle check. */
+/* Type of what a symlink points at, plus its identity for the loop check. */
 static u8 resolve_link(i64 dirfd, const char *name, u64 *dev, u64 *ino) {
     struct stat64 st;
     if (syscall4(SYS_newfstatat, dirfd, (long)name, (long)&st, 0) < 0)
@@ -255,6 +231,12 @@ static u8 resolve_link(i64 dirfd, const char *name, u64 *dev, u64 *ino) {
         case S_IFREG: return DT_REG;
     }
     return DT_UNKNOWN;
+}
+
+static i64 is_ancestor(const LinkNode *chain, u64 dev, u64 ino) {
+    for (; chain; chain = chain->parent)
+        if (chain->ino == ino && chain->dev == dev) return 1;
+    return 0;
 }
 
 static void buf_add(char *buf, i64 *olen, const char *p, i64 plen) {
@@ -413,6 +395,15 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
 
     const ScanCfg *c = s->cfg;
     const GitNode *ign = d->ign;
+    const LinkNode *chain = d->anc;
+    if (c->follow) {
+        struct stat64 st;
+        LinkNode *node = (LinkNode *)bump_alloc(&s->arena, sizeof(LinkNode));
+        if (node && syscall2(SYS_fstat, fd, (long)&st) >= 0) {
+            node->parent = chain; node->dev = st.st_dev; node->ino = st.st_ino;
+            chain = node;
+        }
+    }
     if (c->use_ignore)
         ign = gitignore_load(&s->arena, ign, d->path, d->len);
 
@@ -456,11 +447,7 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
             if (c->follow && type == DT_LNK) {
                 u64 dev = 0, ino = 0;
                 u8 t = resolve_link(fd, name, &dev, &ino);
-                if (t == DT_DIR) {
-                    i64 r = seen_add(s, dev, ino);
-                    if (r < 0) flag_err(s, ERR_FOLLOW);
-                    if (r <= 0) continue;
-                }
+                if (t == DT_DIR && is_ancestor(chain, dev, ino)) continue;
                 type = t;
             }
 
@@ -494,6 +481,7 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
                         sub.len = (i32)flen;
                         sub.depth = (i32)cd;
                         sub.ign = ign;
+                        sub.anc = chain;
                         publish(s, w, &sub);
                     } else {
                         flag_err(s, ERR_ARENA);
@@ -653,7 +641,6 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char **roots, i64 nroots) {
         s->wc[i].dirs = 0; s->wc[i].files = 0; s->wc[i].matches = 0;
     }
     s->workers_live = 0; s->workers_exited = 0;
-    s->seen_lock = 0; s->seen_n = 0;
     g_out_lock = 0;
 
     if (bump_init(&s->arena, ARENA_CAP) < 0) { s->err = ERR_FATAL; return 0; }
@@ -669,7 +656,7 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char **roots, i64 nroots) {
         for (i64 i = 0; i <= rl; i++) rp[i] = root[i];
 
         DirRef r;
-        r.path = rp; r.len = (i32)rl; r.depth = 0; r.ign = 0;
+        r.path = rp; r.len = (i32)rl; r.depth = 0; r.ign = 0; r.anc = 0;
         atomic_xadd(&s->active, 1);
         if (!q_push(s, &r)) { atomic_xadd(&s->active, -1); break; }
         seeded++;

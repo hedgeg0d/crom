@@ -95,7 +95,7 @@ def correctness(d):
     w(f"{deep}/bottom.txt", NEEDLE + b"\n")
     meta["N_DEEP_HIT"] = 1
     os.symlink("../text/sub0/f000.txt", f"{d}/link.txt")
-    meta["N_SYMLINK"] = 1
+    meta["N_SYMLINK"] = 3   # link.txt + follow/side/to_real + follow/real/loop
     # `build` is on crom's built-in ignore list
     w(f"{d}/build/ignored.txt", NEEDLE + b"\n")
 
@@ -116,6 +116,35 @@ def correctness(d):
     meta["N_GLOB_PDF_CS"] = 1          # *.pdf strict: paper.pdf
     meta["N_MAKE_CAP"] = 2             # 'M*' strict: Makefile MyPdfFile.txt
     meta["N_NAMES_TOTAL"] = 8
+
+    # -- hidden entries: skipped unless -H ----------------------------------
+    w(f"{d}/hide/visible.txt", NEEDLE + b"\n")
+    w(f"{d}/hide/.dotfile.txt", NEEDLE + b"\n")
+    w(f"{d}/hide/.dotdir/inside.txt", NEEDLE + b"\n")
+    meta["N_HIDE_PLAIN"] = 1           # visible.txt
+    meta["N_HIDE_ALL"] = 3             # with -H
+
+    # -- a second root, to check that extra paths are searched ---------------
+    w(f"{d}/root2/other.txt", NEEDLE + b"\n")
+    meta["N_ROOT2"] = 1
+
+    # -- symlink cycle: -L must terminate ------------------------------------
+    w(f"{d}/follow/real/deep.txt", NEEDLE + b"\n")
+    os.makedirs(f"{d}/follow/side", exist_ok=True)
+    os.symlink("../real", f"{d}/follow/side/to_real")
+    os.symlink("..", f"{d}/follow/real/loop")
+    meta["N_FOLLOW_PLAIN"] = 1         # follow/real/deep.txt
+    meta["N_FOLLOW_L"] = 2             # + side/to_real/deep.txt (loop refused)
+
+    # -- a name that would run a command if -e pasted it into a shell --------
+    w(f"{d}/inject/a; touch PWNED", b"")
+    w(f"{d}/inject/$(touch SUBST)", b"")
+    meta["N_INJECT"] = 2
+
+    # -- enough output to overflow a 64K pipe, for the broken-pipe test ------
+    for i in range(3000):
+        w(f"{d}/bulk/f{i:04d}.dat", b"")
+    meta["N_BULK"] = 3000
 
     # -- sizes for -s --------------------------------------------------------
     for i, size in enumerate((10, 5000, 200000)):

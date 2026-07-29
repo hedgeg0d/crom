@@ -12,23 +12,29 @@
 #define ERR_ARENA     4   /* path arena exhausted, subtrees dropped */
 #define ERR_TOOLONG   8   /* path would exceed PBUF_SZ, subtree dropped */
 #define ERR_EXEC     16   /* -e command did not fit its buffer, not run */
-#define ERR_FOLLOW   32   /* -L: too many link targets to track, some skipped */
 
 /* Shared backlog; overflow spills to the finder's own stack. */
 #define SCAN_QUEUE_CAP 1024
 #define SCAN_MAX_WORKERS 256
-#define SCAN_SEEN_CAP 8192
 
 typedef struct {
     volatile i64 dirs, files, matches;
     i64 _pad[5];
 } __attribute__((aligned(64))) WCount;
 
+/* -L only: identity of every directory on the way here, so a symlink that
+   points at an ancestor is recognised instead of walked again. */
+typedef struct LinkNode {
+    const struct LinkNode *parent;
+    u64 dev, ino;
+} LinkNode;
+
 typedef struct {
     const char *path;      /* arena-owned, NUL-terminated */
     i32 len;
     i32 depth;
     const GitNode *ign;
+    const LinkNode *anc;
 } DirRef;
 
 typedef struct {
@@ -89,10 +95,6 @@ typedef struct {
     volatile i64 spawned;     /* worker threads created so far (lazily) */
     volatile i64 err;         /* ERR_* bits, OR-ed from every worker */
 
-    /* -L only: directories already entered, so a symlink cycle terminates. */
-    volatile i64 seen_lock;
-    i64 seen_n;
-    struct { u64 dev, ino; } seen[SCAN_SEEN_CAP];
 } Scanner;
 
 /* Runs the whole traversal; the calling thread participates as a worker.

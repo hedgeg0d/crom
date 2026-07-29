@@ -93,6 +93,57 @@ count "[class] still works"       1               crom '[mM]akefile' "$F/names"
 count "-g with a glob is a glob"  "$N_GLOB_PDF"   crom -g '*.pdf' "$F/names"
 count "no match"                  0               crom zzznope "$F/names"
 
+head_ "hidden entries"
+count "dot entries skipped"     "$N_HIDE_PLAIN" crom -c "$NEEDLE" "$F/hide"
+count "-H includes them"        "$N_HIDE_ALL"   crom -H -c "$NEEDLE" "$F/hide"
+count "--hidden long form"      "$N_HIDE_ALL"   crom --hidden -c "$NEEDLE" "$F/hide"
+count "-u is hidden+no-ignore"  "$N_GIT_ALL"    crom -u -c "$NEEDLE" "$F/git"
+
+head_ "search paths"
+count "two roots"        "$((N_HIDE_PLAIN + N_ROOT2))" crom -c "$NEEDLE" "$F/hide" "$F/root2"
+count "three roots"      "$((N_HIDE_PLAIN + N_ROOT2 + N_DEEP_HIT))" \
+                         crom -c "$NEEDLE" "$F/hide" "$F/root2" "$F/deep"
+count "repeated root is scanned twice" "$((N_ROOT2 * 2))" \
+                         crom -c "$NEEDLE" "$F/root2" "$F/root2"
+rc "bad root among good"  2 crom -c "$NEEDLE" "$F/root2" "$F/nope"
+count "good root still searched" "$N_ROOT2" crom -c "$NEEDLE" "$F/root2" "$F/nope"
+is "names the bad root" "1" bash -c "'$CROM' --no-config -c '$NEEDLE' '$F/nope' 2>&1 >/dev/null | command grep -c 'cannot open'"
+is "--no-messages silences it" "0" bash -c "'$CROM' --no-config --no-messages -c '$NEEDLE' '$F/nope' 2>&1 >/dev/null | wc -c"
+
+head_ "symlinks"
+count "not followed by default" "$N_FOLLOW_PLAIN" crom -c "$NEEDLE" "$F/follow"
+count "-L follows"              "$N_FOLLOW_L"     crom -L -c "$NEEDLE" "$F/follow"
+count "-L terminates on a cycle" "$N_FOLLOW_L"    timeout 20 crom -L -c "$NEEDLE" "$F/follow"
+rc "-L exits cleanly"           0                 timeout 20 crom -L -c "$NEEDLE" "$F/follow"
+
+head_ "exclude and limits"
+# an explicitly named root is always scanned, so excludes apply below it
+count "-E prunes a directory"  "$((N_HIDE_ALL - 1))" crom -H -E .dotdir -c "$NEEDLE" "$F/hide"
+count "-E glob on files"       "$((N_HIDE_ALL - 1))" crom -H -E 'visible*' -c "$NEEDLE" "$F/hide"
+count "-E leaves other roots"  "$N_ROOT2" crom -E 'visible*' -c "$NEEDLE" "$F/hide" "$F/root2"
+count "--exclude long form"    "$((N_HIDE_ALL - 1))" crom -H --exclude .dotdir -c "$NEEDLE" "$F/hide"
+count "two -E patterns"        "$((N_HIDE_ALL - 2))" crom -H -E .dotdir -E 'visible*' -c "$NEEDLE" "$F/hide"
+count "--max-results caps"     3 crom --max-results 3 -c "$NEEDLE" "$F/text"
+count "--max-results 1"        1 crom --max-results 1 -c "$NEEDLE" "$F/text"
+count "--max-results above total" "$N_TEXT_HIT" crom --max-results 100000 -c "$NEEDLE" "$F/text"
+
+head_ "content case"
+count "smart case folds"       "$N_TEXT_HIT" crom -c "magic_needle_7" "$F/text"
+count "capital is strict"      0             crom -c "MAGIC_NEEDLE_x7" "$F/text"
+count "-i folds explicitly"    "$N_TEXT_HIT" crom -i -c "MAGIC_NEEDLE_7" "$F/text"
+count "--case-sensitive misses" 0            crom --case-sensitive -c "magic_needle_7" "$F/text"
+
+head_ "output safety"
+is "--json is parseable" "ok" bash -c "'$CROM' --no-config --json -c '$NEEDLE' '$F/weird' | python3 -c '
+import json,sys
+for line in sys.stdin: json.loads(line)
+print(\"ok\")'"
+is "-e cannot inject" "clean" bash -c "
+  cd '$F/inject' && '$CROM' --no-config -H -e 'echo {} >/dev/null' '*' . >/dev/null 2>&1
+  ls PWNED SUBST >/dev/null 2>&1 && echo pwned || echo clean"
+# bulk/ is large enough that crom must write more than one pipe buffer
+is "broken pipe exits 141" "141" bash -c "'$CROM' --no-config '*.dat' '$F/bulk' | head -1 >/dev/null; echo \${PIPESTATUS[0]}"
+
 head_ "gitignore"
 count "inherited into subdirs" "$N_GIT_VISIBLE" crom -c "$NEEDLE" "$F/git"
 count "--no-ignore"            "$N_GIT_ALL"     crom --no-ignore -c "$NEEDLE" "$F/git"
