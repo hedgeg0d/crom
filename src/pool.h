@@ -12,10 +12,12 @@
 #define ERR_ARENA     4   /* path arena exhausted, subtrees dropped */
 #define ERR_TOOLONG   8   /* path would exceed PBUF_SZ, subtree dropped */
 #define ERR_EXEC     16   /* -e command did not fit its buffer, not run */
+#define ERR_FOLLOW   32   /* -L: too many link targets to track, some skipped */
 
 /* Shared backlog; overflow spills to the finder's own stack. */
 #define SCAN_QUEUE_CAP 1024
 #define SCAN_MAX_WORKERS 256
+#define SCAN_SEEN_CAP 8192
 
 typedef struct {
     volatile i64 dirs, files, matches;
@@ -53,6 +55,7 @@ typedef struct {
     i64 null_sep;  /* -0: terminate records with NUL instead of newline */
     i64 use_ignore;
     i64 hidden;               /* -H: descend into and match dot entries */
+    i64 follow;               /* -L: descend into symlinked directories */
     i64 quiet_errs;           /* --no-messages: count problems, don't print */
     i64 bar;
     i64 tty_out;   /* stdout is a terminal -> flush every line */
@@ -85,6 +88,11 @@ typedef struct {
     volatile i64 next_id;
     volatile i64 spawned;     /* worker threads created so far (lazily) */
     volatile i64 err;         /* ERR_* bits, OR-ed from every worker */
+
+    /* -L only: directories already entered, so a symlink cycle terminates. */
+    volatile i64 seen_lock;
+    i64 seen_n;
+    struct { u64 dev, ino; } seen[SCAN_SEEN_CAP];
 } Scanner;
 
 /* Runs the whole traversal; the calling thread participates as a worker.

@@ -33,6 +33,7 @@ static i64 g_color = 1;          /* 0 never, 1 auto, 2 always */
 static i64 g_case = CASE_SMART;
 static i64 g_quiet_errs;         /* --no-messages */
 static i64 g_hidden;             /* -H/--hidden */
+static i64 g_follow;             /* -L/--follow */
 static i64 g_force_glob;         /* -g: anchor the pattern to the whole name */
 static NameMatcher g_nm;
 static NameMatcher g_ex[MAX_EXCLUDES];
@@ -239,6 +240,7 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
     if (str_eq(arg, "-0") || str_eq(arg, "--null")) { g_null_sep = 1; *pi = i; return; }
     if (str_eq(arg, "--no-ignore")) { g_use_ignore = 0; *pi = i; return; }
     if (str_eq(arg, "-H") || str_eq(arg, "--hidden")) { g_hidden = 1; *pi = i; return; }
+    if (str_eq(arg, "-L") || str_eq(arg, "--follow")) { g_follow = 1; *pi = i; return; }
     if (str_eq(arg, "-u") || str_eq(arg, "--unrestricted")) {
         g_hidden = 1; g_use_ignore = 0; *pi = i; return;
     }
@@ -363,6 +365,7 @@ int crom_main(int argc, char **argv, char **envp) {
     cfg.null_sep    = g_null_sep;
     cfg.use_ignore  = g_use_ignore;
     cfg.hidden      = g_hidden;
+    cfg.follow      = g_follow;
     cfg.quiet_errs  = g_quiet_errs;
     cfg.bar         = g_bar;
     cfg.tty_out     = is_tty(STDOUT_FILENO);
@@ -405,13 +408,15 @@ int crom_main(int argc, char **argv, char **envp) {
     }
 
     /* Whole subtrees missing: say so rather than look complete. */
-    if (scanner.err & (ERR_ARENA|ERR_TOOLONG|ERR_EXEC)) {
+    if (scanner.err & (ERR_ARENA|ERR_TOOLONG|ERR_EXEC|ERR_FOLLOW)) {
         if (!g_quiet_errs) {
             write_str(STDERR_FILENO, prog);
             if (scanner.err & ERR_ARENA)
                 write_str(STDERR_FILENO, ": ran out of path memory");
             else if (scanner.err & ERR_TOOLONG)
                 write_str(STDERR_FILENO, ": some paths exceeded the length limit");
+            else if (scanner.err & ERR_FOLLOW)
+                write_str(STDERR_FILENO, ": too many symlinked directories to track");
             else
                 write_str(STDERR_FILENO, ": some -e commands were too long to run");
             write_str(STDERR_FILENO, "; results are incomplete\n");

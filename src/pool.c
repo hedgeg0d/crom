@@ -220,6 +220,43 @@ static u8 resolve_type(i64 dirfd, const char *name) {
     return DT_UNKNOWN;
 }
 
+/* -L only: a cycle must pass through a symlink, so refusing to enter the same
+   link target twice is enough to terminate. Open addressing, ino 0 == empty. */
+static i64 seen_add(Scanner *s, u64 dev, u64 ino) {
+    u64 h = (dev * 1099511628211ULL) ^ (ino * 1469598103934665603ULL);
+    while (atomic_cas(&s->seen_lock, 0, 1) != 0) syscall1(SYS_sched_yield, 0);
+
+    i64 fresh = -1;                 /* -1: table full */
+    if (s->seen_n < SCAN_SEEN_CAP) {
+        fresh = 0;
+        for (i64 k = 0; k < SCAN_SEEN_CAP; k++) {
+            i64 i = (i64)((h + (u64)k) & (SCAN_SEEN_CAP - 1));
+            if (s->seen[i].ino == 0) {
+                s->seen[i].dev = dev; s->seen[i].ino = ino;
+                s->seen_n++;
+                fresh = 1;
+                break;
+            }
+            if (s->seen[i].ino == ino && s->seen[i].dev == dev) break;
+        }
+    }
+    atomic_store(&s->seen_lock, 0);
+    return fresh;
+}
+
+/* Type of what a symlink points at, plus its identity for the cycle check. */
+static u8 resolve_link(i64 dirfd, const char *name, u64 *dev, u64 *ino) {
+    struct stat64 st;
+    if (syscall4(SYS_newfstatat, dirfd, (long)name, (long)&st, 0) < 0)
+        return DT_LNK;
+    *dev = st.st_dev; *ino = st.st_ino;
+    switch (st.st_mode & S_IFMT) {
+        case S_IFDIR: return DT_DIR;
+        case S_IFREG: return DT_REG;
+    }
+    return DT_UNKNOWN;
+}
+
 static void buf_add(char *buf, i64 *olen, const char *p, i64 plen) {
     for (i64 i = 0; i < plen; i++) buf[(*olen)++] = p[i];
 }
@@ -416,6 +453,17 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
 #endif
             if (type == DT_UNKNOWN) type = resolve_type(fd, name);
 
+            if (c->follow && type == DT_LNK) {
+                u64 dev = 0, ino = 0;
+                u8 t = resolve_link(fd, name, &dev, &ino);
+                if (t == DT_DIR) {
+                    i64 r = seen_add(s, dev, ino);
+                    if (r < 0) flag_err(s, ERR_FOLLOW);
+                    if (r <= 0) continue;
+                }
+                type = t;
+            }
+
             i32 is_dir = (type == DT_DIR);
             if (is_dir && match_ignore(name, 1)) continue;
             if (c->use_ignore && gitignore_check(ign, name, is_dir)) continue;
@@ -605,6 +653,7 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char **roots, i64 nroots) {
         s->wc[i].dirs = 0; s->wc[i].files = 0; s->wc[i].matches = 0;
     }
     s->workers_live = 0; s->workers_exited = 0;
+    s->seen_lock = 0; s->seen_n = 0;
     g_out_lock = 0;
 
     if (bump_init(&s->arena, ARENA_CAP) < 0) { s->err = ERR_FATAL; return 0; }
