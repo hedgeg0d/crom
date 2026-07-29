@@ -5,7 +5,10 @@
 #include "arena.h"
 #include "ignore.h"
 
-#define SCAN_QUEUE_CAP 8192
+/* Backlog the workers share. 1024 pending directories is far more than eight
+   threads ever hold at once, and anything bigger only made the ring's pages
+   more expensive to fault in; overflow spills to the finder's own stack. */
+#define SCAN_QUEUE_CAP 1024
 #define SCAN_MAX_WORKERS 256
 
 typedef struct {
@@ -70,7 +73,12 @@ typedef struct {
 } Scanner;
 
 /* Runs the whole traversal; the calling thread participates as a worker.
-   Returns the number of matches. */
+   Returns the number of matches.
+
+   The Scanner must be zero-filled going in (a static or freshly mapped one
+   is): the work queue reads its empty state straight out of that zero image
+   instead of writing every slot before the search starts, so scan_run may be
+   called only once per Scanner. */
 i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root);
 
 #endif

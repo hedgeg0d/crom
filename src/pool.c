@@ -81,15 +81,28 @@ static i64 lstk_pop(Worker *w, DirRef *d) {
     return 1;
 }
 
+/* The ring's generation counters are stored biased by the slot index: an empty
+   slot i holds sequence i, so a bias of -i makes the all-zero BSS image a
+   valid empty queue. Without it every run had to write the whole ring up
+   front, faulting in 32 KB before the first directory was even opened. */
+static inline i64 slot_seq(ScanSlot *sl, i64 idx) {
+    return atomic_load(&sl->seq) + idx;
+}
+
+static inline void slot_publish(ScanSlot *sl, i64 idx, i64 seq) {
+    atomic_store(&sl->seq, seq - idx);
+}
+
 static i64 q_push(Scanner *s, const DirRef *d) {
     for (;;) {
         i64 pos = atomic_load(&s->head);
-        ScanSlot *sl = &s->q[pos & (SCAN_QUEUE_CAP - 1)];
-        i64 dif = atomic_load(&sl->seq) - pos;
+        i64 idx = pos & (SCAN_QUEUE_CAP - 1);
+        ScanSlot *sl = &s->q[idx];
+        i64 dif = slot_seq(sl, idx) - pos;
         if (dif == 0) {
             if (atomic_cas(&s->head, pos, pos + 1) == pos) {
                 sl->d = *d;
-                atomic_store(&sl->seq, pos + 1);
+                slot_publish(sl, idx, pos + 1);
                 return 1;
             }
         } else if (dif < 0) {
@@ -101,12 +114,13 @@ static i64 q_push(Scanner *s, const DirRef *d) {
 static i64 q_pop(Scanner *s, DirRef *d) {
     for (;;) {
         i64 pos = atomic_load(&s->tail);
-        ScanSlot *sl = &s->q[pos & (SCAN_QUEUE_CAP - 1)];
-        i64 dif = atomic_load(&sl->seq) - (pos + 1);
+        i64 idx = pos & (SCAN_QUEUE_CAP - 1);
+        ScanSlot *sl = &s->q[idx];
+        i64 dif = slot_seq(sl, idx) - (pos + 1);
         if (dif == 0) {
             if (atomic_cas(&s->tail, pos, pos + 1) == pos) {
                 *d = sl->d;
-                atomic_store(&sl->seq, pos + SCAN_QUEUE_CAP);
+                slot_publish(sl, idx, pos + SCAN_QUEUE_CAP);
                 return 1;
             }
         } else if (dif < 0) {
@@ -131,16 +145,43 @@ static void scan_finish(Scanner *s) {
 static i64 spawn_thread(i64 (*fn)(void *), void *arg);
 static i64 worker_main(void *arg);
 
+/* Pull the ring's pages in before the first helper starts, so nobody takes
+   those faults from inside q_push: a producer that stalls in a page fault
+   stalls every worker spinning on the ring, which cost ~8% on a big tree.
+
+   `+= 0` rather than a plain store because two slots already hold live
+   entries by now — this rewrites each counter with its own value. Safe
+   unlocked only because the caller is still the single running worker. */
+static void q_prefault(Scanner *s) {
+    for (i64 i = 0; i < SCAN_QUEUE_CAP; i++) s->q[i].seq += 0;
+}
+
 /* Threads are created only once the shared ring actually holds work for
    someone else. A search that finishes inside one directory never pays for a
-   single clone(), which was most of the fixed startup cost. */
+   single clone(), which was most of the fixed startup cost.
+
+   Once the backlog does appear the whole pool goes up in one call: ramping one
+   thread per publish measurably delayed full width on a big tree. */
 static void maybe_spawn(Scanner *s) {
     i64 want = s->cfg->num_workers - 1;          /* the caller is worker 0 */
-    if (want <= 0 || atomic_load(&s->spawned) >= want) return;
-    if (atomic_load(&s->head) - atomic_load(&s->tail) < 2) return;
+    if (want <= 0) return;
 
-    if (atomic_xadd(&s->spawned, 1) >= want) return;   /* lost the race */
-    if (spawn_thread(worker_main, s) == 0) atomic_xadd(&s->workers_live, 1);
+    for (;;) {
+        if (atomic_load(&s->spawned) >= want) return;
+        if (atomic_load(&s->head) - atomic_load(&s->tail) < 2) return;
+        i64 mine = atomic_xadd(&s->spawned, 1);
+        if (mine >= want) return;                          /* lost the race */
+        if (mine == 0) q_prefault(s);
+
+        /* Counted before the clone: scan_run stops waiting once every live
+           worker has exited, and a thread that is visible to the kernel but
+           not yet to that counter could be killed mid-flush. */
+        atomic_xadd(&s->workers_live, 1);
+        if (spawn_thread(worker_main, s) != 0) {
+            atomic_xadd(&s->workers_live, -1);
+            return;
+        }
+    }
 }
 
 static void publish(Scanner *s, Worker *w, const DirRef *d) {
@@ -461,13 +502,13 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     s->bar_live = 0; s->bar_exited = 0; s->err = 0;
     s->next_id = 1;   /* slot 0 belongs to the calling thread */
     s->spawned = 0;
-    for (i64 i = 0; i < SCAN_MAX_WORKERS; i++) {
+    /* Only the slots this run can use: clearing all 256 of them touched 16 KB
+       of pages that nothing else in the process ever reads. */
+    for (i64 i = 0; i < cfg->num_workers; i++) {
         s->wc[i].dirs = 0; s->wc[i].files = 0; s->wc[i].matches = 0;
     }
     s->workers_live = 0; s->workers_exited = 0;
     g_out_lock = 0;
-
-    for (i64 i = 0; i < SCAN_QUEUE_CAP; i++) s->q[i].seq = i;
 
     if (bump_init(&s->arena, ARENA_CAP) < 0) { s->err = 1; return 0; }
 
