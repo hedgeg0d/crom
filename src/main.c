@@ -270,7 +270,7 @@ int crom_main(int argc, char **argv, char **envp) {
         parse_arg(argv[i], argc, argv, &i);
 
     if (g_want_help)    { usage(); return 0; }
-    if (g_want_version) { write_str(STDOUT_FILENO, "crom 0.2.0\n"); return 0; }
+    if (g_want_version) { write_str(STDOUT_FILENO, "crom " CROM_VERSION "\n"); return 0; }
 
     if (g_bad_arg) {
         write_str(STDERR_FILENO, prog);

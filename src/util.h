@@ -57,11 +57,4 @@ static inline i64 write_str_c(i64 fd, const char *s, i64 color) {
     return write_all(fd, buf, sgr_strip(buf, n));
 }
 
-static inline void *crom_memcpy(void *dst, const void *src, i64 n) {
-    u8 *d = (u8 *)dst;
-    const u8 *s = (const u8 *)src;
-    for (i64 i = 0; i < n; i++) d[i] = s[i];
-    return dst;
-}
-
 #endif

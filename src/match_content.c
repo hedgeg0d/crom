@@ -151,14 +151,6 @@ static i64 search_open_fd(i64 fd, const char *needle, i64 nlen,
     }
 }
 
-i64 search_file(const char *path, const char *needle, i64 nlen, u8 *rbuf, i64 rbuf_sz) {
-    i64 fd = syscall3(SYS_openat, AT_FDCWD, (long)path, O_RDONLY|O_CLOEXEC);
-    if (fd < 0) return 0;
-    i64 found = search_open_fd(fd, needle, nlen, rbuf, rbuf_sz);
-    syscall1(SYS_close, fd);
-    return found;
-}
-
 i64 search_file_at(i64 dirfd, const char *name, const char *needle, i64 nlen,
                    u8 *rbuf, i64 rbuf_sz) {
     i64 fd = syscall3(SYS_openat, dirfd, (long)name, O_RDONLY|O_CLOEXEC);
