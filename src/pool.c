@@ -192,7 +192,46 @@ static void publish(Scanner *s, Worker *w, const DirRef *d) {
         if (atomic_load(&s->idle) > 0) wake_all(s);
     } else if (!lstk_push(w, d)) {
         atomic_xadd(&s->active, -1);   /* arena exhausted */
+        atomic_or(&s->err, ERR_ARENA);
     }
+}
+
+static void flag_err(Scanner *s, i64 bit) {
+    if (!(atomic_load(&s->err) & bit)) atomic_or(&s->err, bit);
+}
+
+/* One line per unreadable directory, the way find does it. Held under the
+   output lock so it cannot land in the middle of a result line or of the bar. */
+static void warn_path(Scanner *s, const char *what, const char *path) {
+    flag_err(s, ERR_OPENDIR);
+    if (s->cfg->quiet_errs) return;
+    out_lock();
+    if (s->cfg->bar) display_clear();
+    write_str(STDERR_FILENO, "crom: ");
+    write_str(STDERR_FILENO, what);
+    write_str(STDERR_FILENO, " '");
+    write_str(STDERR_FILENO, path);
+    write_str(STDERR_FILENO, "'\n");
+    out_unlock();
+}
+
+/* Most filesystems hand the type back in d_type, but some (parts of FUSE, NFS,
+   overlayfs) always answer DT_UNKNOWN. Treating that as "not a directory and
+   not a file" made crom return nothing at all there, so ask the kernel. */
+static u8 resolve_type(i64 dirfd, const char *name) {
+    struct stat64 st;
+    if (syscall4(SYS_newfstatat, dirfd, (long)name, (long)&st,
+                 AT_SYMLINK_NOFOLLOW) < 0) return DT_UNKNOWN;
+    switch (st.st_mode & S_IFMT) {
+        case S_IFDIR:  return DT_DIR;
+        case S_IFREG:  return DT_REG;
+        case S_IFLNK:  return DT_LNK;
+        case S_IFIFO:  return DT_FIFO;
+        case S_IFSOCK: return DT_SOCK;
+        case S_IFCHR:  return DT_CHR;
+        case S_IFBLK:  return DT_BLK;
+    }
+    return DT_UNKNOWN;
 }
 
 static void buf_add(char *buf, i64 *olen, const char *p, i64 plen) {
@@ -212,11 +251,30 @@ static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
     const char term = w->s->cfg->null_sep ? '\0' : '\n';
 
     if (json) {
-        if (w->olen + 2 * len + 16 > OBUF_SZ) buf_flush(w);
+        /* Six bytes is the worst case per byte (\u00XX), and file names really
+           do contain newlines and tabs -- escaping only " and \ produced JSON
+           that no parser would accept. */
+        if (w->olen + 6 * len + 16 > OBUF_SZ) buf_flush(w);
         buf_add(w->obuf, &w->olen, "{\"path\":\"", 9);
         for (i64 i = 0; i < len; i++) {
-            if (path[i] == '"' || path[i] == '\\') w->obuf[w->olen++] = '\\';
-            w->obuf[w->olen++] = path[i];
+            u8 ch = (u8)path[i];
+            switch (ch) {
+                case '"':  buf_add(w->obuf, &w->olen, "\\\"", 2); continue;
+                case '\\': buf_add(w->obuf, &w->olen, "\\\\", 2); continue;
+                case '\b': buf_add(w->obuf, &w->olen, "\\b", 2);  continue;
+                case '\f': buf_add(w->obuf, &w->olen, "\\f", 2);  continue;
+                case '\n': buf_add(w->obuf, &w->olen, "\\n", 2);  continue;
+                case '\r': buf_add(w->obuf, &w->olen, "\\r", 2);  continue;
+                case '\t': buf_add(w->obuf, &w->olen, "\\t", 2);  continue;
+            }
+            if (ch < 0x20) {
+                static const char hex[] = "0123456789abcdef";
+                buf_add(w->obuf, &w->olen, "\\u00", 4);
+                w->obuf[w->olen++] = hex[ch >> 4];
+                w->obuf[w->olen++] = hex[ch & 15];
+                continue;
+            }
+            w->obuf[w->olen++] = (char)ch;
         }
         buf_add(w->obuf, &w->olen, "\"}", 2);
         w->obuf[w->olen++] = term;
@@ -229,19 +287,47 @@ static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
     if (w->s->cfg->tty_out) buf_flush(w);
 }
 
-static void exec_file(const char *cmd, const char *path, i64 len) {
-    char buf[PBUF_SZ];
+/* {} expands to a single-quoted path, with any embedded quote closed, escaped
+   and reopened ('\''). Pasting the raw name in let a file called `a; rm -rf x`
+   run whatever it liked, and a name long enough to overflow buf used to be
+   truncated and executed anyway -- half a command is more dangerous than none,
+   so an overflow now refuses to run at all. */
+static i64 exec_quote(char *buf, i64 cap, const char *cmd,
+                      const char *path, i64 len) {
     i64 pos = 0;
-    const char *c = cmd;
-    while (*c && pos + len + 2 < (i64)sizeof(buf)) {
-        if (*c == '{' && c[1] == '}') {
-            for (i64 i = 0; i < len; i++) buf[pos++] = path[i];
+    for (const char *c = cmd; *c; ) {
+        if (c[0] == '{' && c[1] == '}') {
+            if (pos + 2 > cap) return -1;
+            buf[pos++] = '\'';
+            for (i64 i = 0; i < len; i++) {
+                if (path[i] == '\'') {
+                    if (pos + 4 > cap) return -1;
+                    buf[pos++] = '\''; buf[pos++] = '\\';
+                    buf[pos++] = '\''; buf[pos++] = '\'';
+                } else {
+                    if (pos + 1 > cap) return -1;
+                    buf[pos++] = path[i];
+                }
+            }
+            if (pos + 1 > cap) return -1;
+            buf[pos++] = '\'';
             c += 2;
         } else {
+            if (pos + 1 > cap) return -1;
             buf[pos++] = *c++;
         }
     }
+    if (pos >= cap) return -1;
     buf[pos] = 0;
+    return pos;
+}
+
+static void exec_file(Scanner *s, const char *cmd, const char *path, i64 len) {
+    char buf[PBUF_SZ];
+    if (exec_quote(buf, (i64)sizeof(buf) - 1, cmd, path, len) < 0) {
+        flag_err(s, ERR_EXEC);
+        return;
+    }
 
     i64 pid = syscall0(SYS_fork);
     if (pid < 0) return;
@@ -288,7 +374,7 @@ static void consider(Scanner *s, Worker *w, i64 dirfd, const char *path,
 
     if (c->exec_cmd) {
         out_lock();
-        exec_file(c->exec_cmd, path, len);
+        exec_file(s, c->exec_cmd, path, len);
         out_unlock();
     } else {
         buf_emit(w, path, len, c->json_out);
@@ -298,7 +384,7 @@ static void consider(Scanner *s, Worker *w, i64 dirfd, const char *path,
 static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
     i64 fd = syscall3(SYS_openat, AT_FDCWD, (long)d->path,
                       O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if (fd < 0) return;
+    if (fd < 0) { warn_path(s, "cannot open", d->path); return; }
 
     const ScanCfg *c = s->cfg;
     const GitNode *ign = d->ign;
@@ -307,7 +393,11 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
 
     char pbuf[PBUF_SZ];
     i64 plen = d->len;
-    if (plen >= PBUF_SZ - 2) { syscall1(SYS_close, fd); return; }
+    if (plen >= PBUF_SZ - 2) {
+        flag_err(s, ERR_TOOLONG);
+        syscall1(SYS_close, fd);
+        return;
+    }
     for (i64 i = 0; i < plen; i++) pbuf[i] = d->path[i];
     if (plen == 0) pbuf[plen++] = '.';
     if (pbuf[plen - 1] != '/') pbuf[plen++] = '/';
@@ -329,12 +419,17 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
             }
 
             u8 type = e->d_type;
+#ifdef CROM_FORCE_DT_UNKNOWN
+            type = DT_UNKNOWN;      /* test build: pretend the fs told us nothing */
+#endif
+            if (type == DT_UNKNOWN) type = resolve_type(fd, name);
+
             i32 is_dir = (type == DT_DIR);
             if (is_dir && match_ignore(name, 1)) continue;
             if (c->use_ignore && gitignore_check(ign, name, is_dir)) continue;
 
             i64 nl = str_len(name);
-            if (prefix + nl >= PBUF_SZ) continue;
+            if (prefix + nl >= PBUF_SZ) { flag_err(s, ERR_TOOLONG); continue; }
             for (i64 i = 0; i < nl; i++) pbuf[prefix + i] = name[i];
             i64 flen = prefix + nl;
             pbuf[flen] = 0;
@@ -353,6 +448,8 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
                         sub.depth = (i32)cd;
                         sub.ign = ign;
                         publish(s, w, &sub);
+                    } else {
+                        flag_err(s, ERR_ARENA);
                     }
                 }
             } else if (type == DT_REG) {
@@ -494,7 +591,7 @@ static i64 spawn_thread(i64 (*fn)(void *), void *arg) {
     return 0;
 }
 
-i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
+i64 scan_run(Scanner *s, const ScanCfg *cfg, const char **roots, i64 nroots) {
     s->cfg = cfg;
     s->head = 0; s->tail = 0;
     s->active = 0; s->done = 0; s->work_gen = 0; s->idle = 0;
@@ -510,18 +607,26 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     s->workers_live = 0; s->workers_exited = 0;
     g_out_lock = 0;
 
-    if (bump_init(&s->arena, ARENA_CAP) < 0) { s->err = 1; return 0; }
+    if (bump_init(&s->arena, ARENA_CAP) < 0) { s->err = ERR_FATAL; return 0; }
 
-    if (!root || !root[0]) root = ".";
-    i64 rl = str_len(root);
-    char *rp = (char *)bump_alloc(&s->arena, rl + 1);
-    if (!rp) { s->err = 1; return 0; }
-    for (i64 i = 0; i <= rl; i++) rp[i] = root[i];
+    /* Every root goes in before any worker starts, so each one is scanned with
+       its own depth origin and the pool balances across all of them at once. */
+    i64 seeded = 0;
+    for (i64 k = 0; k < nroots; k++) {
+        const char *root = roots[k];
+        if (!root || !root[0]) root = ".";
+        i64 rl = str_len(root);
+        char *rp = (char *)bump_alloc(&s->arena, rl + 1);
+        if (!rp) { s->err = ERR_FATAL; return 0; }
+        for (i64 i = 0; i <= rl; i++) rp[i] = root[i];
 
-    DirRef r;
-    r.path = rp; r.len = (i32)rl; r.depth = 0; r.ign = 0;
-    atomic_xadd(&s->active, 1);
-    if (!q_push(s, &r)) { s->err = 1; return 0; }
+        DirRef r;
+        r.path = rp; r.len = (i32)rl; r.depth = 0; r.ign = 0;
+        atomic_xadd(&s->active, 1);
+        if (!q_push(s, &r)) { atomic_xadd(&s->active, -1); break; }
+        seeded++;
+    }
+    if (seeded == 0) { s->err = ERR_FATAL; return 0; }
 
     if (cfg->bar && spawn_thread(bar_main, s) == 0)
         atomic_xadd(&s->bar_live, 1);

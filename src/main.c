@@ -30,6 +30,7 @@ static i64 g_bad_from_config;
 static i64 g_in_config;
 static i64 g_color = 1;          /* 0 never, 1 auto, 2 always */
 static i64 g_case = CASE_SMART;
+static i64 g_quiet_errs;         /* --no-messages */
 static i64 g_force_glob;         /* -g: anchor the pattern to the whole name */
 
 /* Resolved per stream: help goes to stdout, the bar and summary to stderr,
@@ -42,7 +43,10 @@ static i64 color_on(i64 fd) {
 static i64 g_binary;
 static const char *g_exec_cmd;
 
-static const char *target;
+#define MAX_ROOTS 64
+static const char *roots[MAX_ROOTS];
+static i64 n_roots;
+static i64 g_too_many_roots;
 static i32 saw_dash;
 
 static void usage(void) {
@@ -156,17 +160,25 @@ static i64 load_config(char **envp) {
     return cfg_argc;
 }
 
-/* A bare word is a glob, anything that looks like a location is the path.
-   After '--' a leading '-' also means "path": that is the whole reason to
-   write '--', and a glob starting with a dash can still go through -n. */
+/* The first bare word is the pattern, anything that looks like a location is a
+   root, and every further argument is another root. After '--' a leading '-'
+   also means "root": that is the whole reason to write '--', and a pattern
+   starting with a dash can still go through -n.
+
+   Extra arguments used to be dropped on the floor, so `crom '*.sh' src tests`
+   quietly searched only src and reported nothing. */
+static void add_root(const char *arg) {
+    if (n_roots < MAX_ROOTS) roots[n_roots++] = arg;
+    else g_too_many_roots = 1;
+}
+
 static void positional(const char *arg) {
-    if (arg[0] == '/' || arg[0] == '.' || arg[0] == '~' || arg[0] == '-') {
-        if (!target) target = arg;
-        else if (!pattern) pattern = arg;
-    } else {
-        if (!pattern) pattern = arg;
-        else if (!target) target = arg;
+    if (!pattern &&
+        !(arg[0] == '/' || arg[0] == '.' || arg[0] == '~' || arg[0] == '-')) {
+        pattern = arg;
+        return;
     }
+    add_root(arg);
 }
 
 static void parse_arg(const char *arg, int ac, char **av, int *pi) {
@@ -214,6 +226,7 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
     if (str_eq(arg, "-a") || str_eq(arg, "--text")) { g_binary = 1; *pi = i; return; }
     if (str_eq(arg, "-0") || str_eq(arg, "--null")) { g_null_sep = 1; *pi = i; return; }
     if (str_eq(arg, "--no-ignore")) { g_use_ignore = 0; *pi = i; return; }
+    if (str_eq(arg, "--no-messages")) { g_quiet_errs = 1; *pi = i; return; }
     if (str_eq(arg, "--no-config")) { *pi = i; return; }
     if (str_eq(arg, "--json")) { g_json = 1; *pi = i; return; }
     if (str_eq(arg, "--no-color")) { g_color = 0; *pi = i; return; }
@@ -253,7 +266,7 @@ int crom_main(int argc, char **argv, char **envp) {
     for (int i = 1; i < argc; i++)
         if (str_eq(argv[i], "--no-config")) no_cfg = 1;
 
-    target = 0;
+    n_roots = 0;
     saw_dash = 0;
 
     if (!no_cfg) {
@@ -283,7 +296,12 @@ int crom_main(int argc, char **argv, char **envp) {
         return 2;
     }
 
-    if (!target) target = ".";
+    if (g_too_many_roots) {
+        write_str(STDERR_FILENO, prog);
+        write_str(STDERR_FILENO, ": too many search paths\n");
+        return 2;
+    }
+    if (n_roots == 0) { roots[0] = "."; n_roots = 1; }
     if (!pattern && !needle) pattern = "*";
     if (num_threads <= 0) num_threads = nproc();
     if (num_threads > SCAN_MAX_WORKERS) num_threads = SCAN_MAX_WORKERS;
@@ -307,30 +325,66 @@ int crom_main(int argc, char **argv, char **envp) {
     cfg.json_out    = g_json;
     cfg.null_sep    = g_null_sep;
     cfg.use_ignore  = g_use_ignore;
+    cfg.quiet_errs  = g_quiet_errs;
     cfg.bar         = g_bar;
     cfg.tty_out     = is_tty(STDOUT_FILENO);
     cfg.num_workers = num_threads;
 
-    i64 rfd = syscall3(SYS_openat, AT_FDCWD, (long)target,
-                       O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if (rfd < 0) {
-        write_str(STDERR_FILENO, prog);
-        write_str(STDERR_FILENO, ": cannot open '");
-        write_str(STDERR_FILENO, target);
-        write_str(STDERR_FILENO, "'\n");
-        return 2;
+    /* Check the roots up front, as find does: name every bad one, keep going
+       with the rest, and only fail outright when none of them is usable. */
+    i64 usable = 0, bad = 0;
+    for (i64 i = 0; i < n_roots; i++) {
+        i64 rfd = syscall3(SYS_openat, AT_FDCWD, (long)roots[i],
+                           O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+        if (rfd < 0) {
+            bad = 1;
+            if (!g_quiet_errs) {
+                write_str(STDERR_FILENO, prog);
+                write_str(STDERR_FILENO, ": cannot open '");
+                write_str(STDERR_FILENO, roots[i]);
+                write_str(STDERR_FILENO, "'\n");
+            }
+            continue;
+        }
+        syscall1(SYS_close, rfd);
+        roots[usable++] = roots[i];
     }
-    syscall1(SYS_close, rfd);
+    if (usable == 0) return 2;
+    n_roots = usable;
 
-    g_matches = scan_run(&scanner, &cfg, target);
+    g_matches = scan_run(&scanner, &cfg, roots, n_roots);
 
     if (g_bar)
         display_done(scanner.n_dirs, scanner.n_files, g_matches, 0);
 
-    if (scanner.err) {
+    /* A path the user named and we could not open is a usage error even if the
+       other roots produced matches, which is how grep -r treats it. */
+    if (bad) return 2;
+
+    if (scanner.err & ERR_FATAL) {
         write_str(STDERR_FILENO, prog);
         write_str(STDERR_FILENO, ": scan failed\n");
         return 2;
     }
+
+    /* A short answer that looks complete is the worst outcome, so say it. An
+       unreadable directory is common enough to be only a warning per path
+       (already printed); the rest mean whole subtrees are missing. */
+    if (scanner.err & (ERR_ARENA|ERR_TOOLONG|ERR_EXEC)) {
+        if (!g_quiet_errs) {
+            write_str(STDERR_FILENO, prog);
+            if (scanner.err & ERR_ARENA)
+                write_str(STDERR_FILENO, ": ran out of path memory");
+            else if (scanner.err & ERR_TOOLONG)
+                write_str(STDERR_FILENO, ": some paths exceeded the length limit");
+            else
+                write_str(STDERR_FILENO, ": some -e commands were too long to run");
+            write_str(STDERR_FILENO, "; results are incomplete\n");
+        }
+        return 2;
+    }
+    /* ERR_OPENDIR deliberately does not change the exit code: scanning any
+       large tree as a normal user hits a directory it may not read, and every
+       one of them was already named on stderr. */
     return g_matches > 0 ? 0 : 1;   /* grep convention: 1 == no matches */
 }

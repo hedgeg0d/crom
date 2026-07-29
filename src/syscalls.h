@@ -25,6 +25,7 @@
 #define SYS_fsync         74
 #define SYS_ftruncate     77
 #define SYS_getdents64   217
+#define SYS_newfstatat   262
 #define SYS_gettid       186
 #define SYS_futex        202
 #define SYS_sched_yield   24

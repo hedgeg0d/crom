@@ -18,6 +18,10 @@ static inline i64 atomic_xadd(volatile i64 *p, i64 v) {
     return v;
 }
 
+static inline void atomic_or(volatile i64 *p, i64 v) {
+    __asm__ volatile ("lock or %1, %0" : "+m"(*p) : "r"(v) : "memory");
+}
+
 static inline i64 atomic_cas(volatile i64 *p, i64 exp, i64 des) {
     i64 old = exp;
     __asm__ volatile ("lock cmpxchg %2, %1"
