@@ -14,9 +14,21 @@
 static i32 g_bc[256];
 static i64 g_bc_ready;
 
-void content_prepare(const char *needle, i64 nlen) {
-    if (nlen < BM_THRESH) return;
+/* Folded search is a separate path so the sensitive one keeps its speed. */
+static i64 g_icase;
+static u8  g_fold[256];
+
+void content_prepare(const char *needle, i64 nlen, i64 icase) {
     const u8 *n = (const u8 *)needle;
+
+    g_icase = icase;
+    if (icase) {
+        for (i64 i = 0; i < 256; i++) g_fold[i] = (u8)i;
+        for (i64 c = 'A'; c <= 'Z'; c++) g_fold[c] = (u8)(c + 32);
+        return;
+    }
+
+    if (nlen < BM_THRESH) return;
     for (i64 i = 0; i < 256; i++) g_bc[i] = (i32)nlen;
     for (i64 i = 0; i < nlen - 1; i++) g_bc[n[i]] = (i32)(nlen - 1 - i);
     g_bc_ready = 1;
@@ -39,6 +51,64 @@ static i64 bm_search(const u8 *data, i64 len, const u8 *n, i64 nl) {
             j--; k--;
         }
         i += bc[data[i]];
+    }
+    return 0;
+}
+
+/* Candidates from either case of the first byte, verified through the fold
+   table. Boyer-Moore over folded bytes was correct but 40% slower. */
+static inline i64 ci_eq(const u8 *h, const u8 *n, i64 nl) {
+    for (i64 j = 1; j < nl; j++)
+        if (g_fold[h[j]] != g_fold[n[j]]) return 0;
+    return 1;
+}
+
+static i64 ci_search(const u8 *data, i64 len, const u8 *n, i64 nl) {
+    const u8 f0 = g_fold[n[0]];
+    const u8 c_up = (f0 >= 'a' && f0 <= 'z') ? (u8)(f0 - 32) : f0;
+    const u8 *end = data + len - nl + 1;
+
+#ifdef __AVX2__
+    {
+    __m256i vlo = _mm256_set1_epi8((char)f0);
+    __m256i vup = _mm256_set1_epi8((char)c_up);
+    while (data + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)data);
+        u32 mask = (u32)_mm256_movemask_epi8(
+            _mm256_or_si256(_mm256_cmpeq_epi8(chunk, vlo),
+                            _mm256_cmpeq_epi8(chunk, vup)));
+        while (mask) {
+            u32 i = (u32)__builtin_ctz(mask);
+            if (ci_eq(data + i, n, nl)) return 1;
+            mask &= mask - 1;
+        }
+        data += 32;
+    }
+    }
+#endif
+
+#ifdef __SSE4_2__
+    {
+    __m128i vlo = _mm_set1_epi8((char)f0);
+    __m128i vup = _mm_set1_epi8((char)c_up);
+    while (data + 16 <= end) {
+        __m128i chunk = _mm_loadu_si128((const __m128i *)data);
+        u32 mask = (u32)_mm_movemask_epi8(
+            _mm_or_si128(_mm_cmpeq_epi8(chunk, vlo),
+                         _mm_cmpeq_epi8(chunk, vup)));
+        while (mask) {
+            u32 i = (u32)__builtin_ctz(mask);
+            if (ci_eq(data + i, n, nl)) return 1;
+            mask &= mask - 1;
+        }
+        data += 16;
+    }
+    }
+#endif
+
+    for (; data < end; data++) {
+        if (*data != f0 && *data != c_up) continue;
+        if (ci_eq(data, n, nl)) return 1;
     }
     return 0;
 }
@@ -108,6 +178,8 @@ static i64 simd_search(const u8 *data, i64 len, const char *needle, i64 nlen) {
 i64 content_search(const u8 *data, i64 len, const char *needle, i64 nlen) {
     if (nlen == 0) return 1;
     if (len < nlen) return 0;
+
+    if (g_icase) return ci_search(data, len, (const u8 *)needle, nlen);
 
     if (nlen >= BM_THRESH)
         return bm_search(data, len, (const u8 *)needle, nlen);

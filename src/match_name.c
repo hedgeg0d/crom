@@ -1,18 +1,5 @@
 #include "match_name.h"
 
-/* Case folding is a table rather than a branch: for a case-sensitive search it
-   is the identity map, so both modes run the same code and the comparison loops
-   stay free of per-character tests. */
-static u8 g_fold[256];
-
-static const char *g_pat;
-static i64 g_plen;
-static i64 g_substr;        /* match anywhere in the name instead of all of it */
-static i64 g_meta;          /* pattern holds * ? or [ */
-static i64 g_pfxl;          /* literal run before the first metacharacter */
-static const char *g_sfx;   /* literal tail after the last '*', or 0 */
-static i64 g_sfxl;
-
 static i64 has_meta(const char *p) {
     for (; *p; p++) {
         if (*p == '*' || *p == '?' || *p == '[') return 1;
@@ -26,22 +13,21 @@ static i64 len_of(const char *s) {
     return n;
 }
 
-/* Everything here used to be recomputed per candidate file: the matcher walked
-   the pattern three times (metacharacter scan, literal prefix, last '*') for
-   every name it was handed. */
-void name_prepare(const char *pattern, i64 case_mode, i64 force_glob) {
-    for (i64 i = 0; i < 256; i++) g_fold[i] = (u8)i;
-    g_pat = pattern;
-    g_plen = 0; g_substr = 0; g_meta = 0;
-    g_pfxl = 0; g_sfx = 0; g_sfxl = 0;
+/* Folding is a table, identity when case-sensitive, so both modes share one
+   code path. All of this used to be recomputed for every candidate name. */
+void name_compile(NameMatcher *m, const char *pattern, i64 case_mode,
+                  i64 force_glob) {
+    for (i64 i = 0; i < 256; i++) m->fold[i] = (u8)i;
+    m->pat = pattern;
+    m->plen = 0; m->substr = 0; m->meta = 0;
+    m->pfxl = 0; m->sfx = 0; m->sfxl = 0;
     if (!pattern) return;
 
-    g_plen = len_of(pattern);
-    g_meta = has_meta(pattern);
+    m->plen = len_of(pattern);
+    m->meta = has_meta(pattern);
 
-    /* A bare word is what people type when they mean "name contains this";
-       a pattern carrying * ? or [ is a glob over the whole name, as before. */
-    g_substr = !force_glob && !g_meta;
+    /* A bare word means "name contains this"; * ? [ make it a whole-name glob. */
+    m->substr = !force_glob && !m->meta;
 
     i64 icase;
     if (case_mode == CASE_SENSITIVE)   icase = 0;
@@ -52,46 +38,47 @@ void name_prepare(const char *pattern, i64 case_mode, i64 force_glob) {
             if (*p >= 'A' && *p <= 'Z') { icase = 0; break; }   /* meant it */
     }
     if (icase)
-        for (i64 c = 'A'; c <= 'Z'; c++) g_fold[c] = (u8)(c + 32);
+        for (i64 c = 'A'; c <= 'Z'; c++) m->fold[c] = (u8)(c + 32);
 
     const char *e = pattern;
     while (*e && *e != '*' && *e != '?' && *e != '[') e++;
-    g_pfxl = e - pattern;
+    m->pfxl = e - pattern;
 
     const char *last_star = 0;
     for (const char *p = pattern; *p; p++)
         if (*p == '*') last_star = p;
     if (last_star && last_star[1] && !has_meta(last_star + 1)) {
-        g_sfx = last_star + 1;
-        g_sfxl = len_of(g_sfx);
+        m->sfx = last_star + 1;
+        m->sfxl = len_of(m->sfx);
     }
 }
 
-static i64 match_substr(const char *name, i64 nlen) {
-    const char *pat = g_pat;
-    u8 p0 = g_fold[(u8)pat[0]];
-    const char *last = name + nlen - g_plen;   /* no room to match past here */
+static i64 match_substr(const NameMatcher *m, const char *name, i64 nlen) {
+    const u8 *fold = m->fold;
+    const char *pat = m->pat;
+    u8 p0 = fold[(u8)pat[0]];
+    const char *last = name + nlen - m->plen;   /* no room to match past here */
     for (const char *h = name; h <= last; h++) {
-        if (g_fold[(u8)*h] != p0) continue;
+        if (fold[(u8)*h] != p0) continue;
         const char *a = h + 1, *b = pat + 1;
-        while (*b && g_fold[(u8)*a] == g_fold[(u8)*b]) { a++; b++; }
+        while (*b && fold[(u8)*a] == fold[(u8)*b]) { a++; b++; }
         if (!*b) return 1;
     }
     return 0;
 }
 
-static i64 match_class(const char *cp, const char **end, char c) {
+static i64 match_class(const u8 *fold, const char *cp, const char **end, char c) {
     int neg = 0;
     if (*cp == '!') { neg = 1; cp++; }
     i64 ok = 0;
-    u8 fc = g_fold[(u8)c];
+    u8 fc = fold[(u8)c];
     const char *p = cp;
     while (*p && *p != ']') {
         if (p[1] == '-' && p[2] && p[2] != ']') {
-            if (fc >= g_fold[(u8)*p] && fc <= g_fold[(u8)p[2]]) ok = 1;
+            if (fc >= fold[(u8)*p] && fc <= fold[(u8)p[2]]) ok = 1;
             p += 3;
         } else {
-            if (fc == g_fold[(u8)*p]) ok = 1;
+            if (fc == fold[(u8)*p]) ok = 1;
             p++;
         }
     }
@@ -100,13 +87,13 @@ static i64 match_class(const char *cp, const char **end, char c) {
     return neg ? !ok : ok;
 }
 
-static i64 glob_impl(const char *p, const char *n) {
+static i64 glob_impl(const u8 *fold, const char *p, const char *n) {
     while (*p) {
         if (*p == '*') {
             do { p++; } while (*p == '*');
             if (*p == 0) return 1;
             for (; *n; n++) {
-                if (glob_impl(p, n)) return 1;
+                if (glob_impl(fold, p, n)) return 1;
             }
             return 0;
         }
@@ -117,40 +104,42 @@ static i64 glob_impl(const char *p, const char *n) {
         }
         if (*p == '[') {
             const char *end;
-            if (!match_class(p + 1, &end, *n)) return 0;
+            if (!match_class(fold, p + 1, &end, *n)) return 0;
             if (*n == 0 || *n == '/') return 0;
             p = end; n++;
             continue;
         }
-        if (g_fold[(u8)*p] != g_fold[(u8)*n]) return 0;
+        if (fold[(u8)*p] != fold[(u8)*n]) return 0;
         p++; n++;
     }
     return *n == 0 || *n == '/';
 }
 
-i64 match_name(const char *name, i64 nlen) {
-    if (g_plen == 0) return 1;
-    if (nlen < g_plen && !g_meta) return 0;   /* too short either way */
+i64 name_match(const NameMatcher *m, const char *name, i64 nlen) {
+    if (m->plen == 0) return 1;
+    if (nlen < m->plen && !m->meta) return 0;   /* too short either way */
 
-    if (g_substr) return match_substr(name, nlen);
+    if (m->substr) return match_substr(m, name, nlen);
 
-    if (!g_meta) {
-        for (i64 i = 0; i < g_plen; i++)
-            if (g_fold[(u8)name[i]] != g_fold[(u8)g_pat[i]]) return 0;
-        return nlen == g_plen;
+    const u8 *fold = m->fold;
+
+    if (!m->meta) {
+        for (i64 i = 0; i < m->plen; i++)
+            if (fold[(u8)name[i]] != fold[(u8)m->pat[i]]) return 0;
+        return nlen == m->plen;
     }
 
-    if (g_pfxl) {
-        if (nlen < g_pfxl) return 0;
-        for (i64 i = 0; i < g_pfxl; i++)
-            if (g_fold[(u8)name[i]] != g_fold[(u8)g_pat[i]]) return 0;
+    if (m->pfxl) {
+        if (nlen < m->pfxl) return 0;
+        for (i64 i = 0; i < m->pfxl; i++)
+            if (fold[(u8)name[i]] != fold[(u8)m->pat[i]]) return 0;
     }
 
-    if (g_sfx) {
-        if (nlen < g_sfxl) return 0;
-        for (i64 i = 0; i < g_sfxl; i++)
-            if (g_fold[(u8)name[nlen - g_sfxl + i]] != g_fold[(u8)g_sfx[i]]) return 0;
+    if (m->sfx) {
+        if (nlen < m->sfxl) return 0;
+        for (i64 i = 0; i < m->sfxl; i++)
+            if (fold[(u8)name[nlen - m->sfxl + i]] != fold[(u8)m->sfx[i]]) return 0;
     }
 
-    return glob_impl(g_pat, name);
+    return glob_impl(fold, m->pat, name);
 }

@@ -81,10 +81,8 @@ static i64 lstk_pop(Worker *w, DirRef *d) {
     return 1;
 }
 
-/* The ring's generation counters are stored biased by the slot index: an empty
-   slot i holds sequence i, so a bias of -i makes the all-zero BSS image a
-   valid empty queue. Without it every run had to write the whole ring up
-   front, faulting in 32 KB before the first directory was even opened. */
+/* Sequence counters are biased by slot index so the zero-filled BSS is already
+   a valid empty ring; initialising it cost 32 KB of page faults per run. */
 static inline i64 slot_seq(ScanSlot *sl, i64 idx) {
     return atomic_load(&sl->seq) + idx;
 }
@@ -145,23 +143,14 @@ static void scan_finish(Scanner *s) {
 static i64 spawn_thread(i64 (*fn)(void *), void *arg);
 static i64 worker_main(void *arg);
 
-/* Pull the ring's pages in before the first helper starts, so nobody takes
-   those faults from inside q_push: a producer that stalls in a page fault
-   stalls every worker spinning on the ring, which cost ~8% on a big tree.
-
-   `+= 0` rather than a plain store because two slots already hold live
-   entries by now — this rewrites each counter with its own value. Safe
-   unlocked only because the caller is still the single running worker. */
+/* Fault the ring in before the first helper: a producer stalling inside q_push
+   stalls everyone spinning on it. `+= 0` keeps the two live entries intact. */
 static void q_prefault(Scanner *s) {
     for (i64 i = 0; i < SCAN_QUEUE_CAP; i++) s->q[i].seq += 0;
 }
 
-/* Threads are created only once the shared ring actually holds work for
-   someone else. A search that finishes inside one directory never pays for a
-   single clone(), which was most of the fixed startup cost.
-
-   Once the backlog does appear the whole pool goes up in one call: ramping one
-   thread per publish measurably delayed full width on a big tree. */
+/* No clone() until the ring holds work for someone else; then the whole pool
+   goes up at once, since ramping one thread per publish delayed full width. */
 static void maybe_spawn(Scanner *s) {
     i64 want = s->cfg->num_workers - 1;          /* the caller is worker 0 */
     if (want <= 0) return;
@@ -173,9 +162,8 @@ static void maybe_spawn(Scanner *s) {
         if (mine >= want) return;                          /* lost the race */
         if (mine == 0) q_prefault(s);
 
-        /* Counted before the clone: scan_run stops waiting once every live
-           worker has exited, and a thread that is visible to the kernel but
-           not yet to that counter could be killed mid-flush. */
+        /* Counted before the clone, or scan_run could stop waiting on a thread
+           that exists but is not yet visible to the counter. */
         atomic_xadd(&s->workers_live, 1);
         if (spawn_thread(worker_main, s) != 0) {
             atomic_xadd(&s->workers_live, -1);
@@ -200,8 +188,7 @@ static void flag_err(Scanner *s, i64 bit) {
     if (!(atomic_load(&s->err) & bit)) atomic_or(&s->err, bit);
 }
 
-/* One line per unreadable directory, the way find does it. Held under the
-   output lock so it cannot land in the middle of a result line or of the bar. */
+/* Under the output lock so it cannot land inside a result line or the bar. */
 static void warn_path(Scanner *s, const char *what, const char *path) {
     flag_err(s, ERR_OPENDIR);
     if (s->cfg->quiet_errs) return;
@@ -215,9 +202,8 @@ static void warn_path(Scanner *s, const char *what, const char *path) {
     out_unlock();
 }
 
-/* Most filesystems hand the type back in d_type, but some (parts of FUSE, NFS,
-   overlayfs) always answer DT_UNKNOWN. Treating that as "not a directory and
-   not a file" made crom return nothing at all there, so ask the kernel. */
+/* Some filesystems (FUSE, NFS, overlayfs) always answer DT_UNKNOWN, and taking
+   that as "neither file nor directory" made crom find nothing there. */
 static u8 resolve_type(i64 dirfd, const char *name) {
     struct stat64 st;
     if (syscall4(SYS_newfstatat, dirfd, (long)name, (long)&st,
@@ -251,9 +237,7 @@ static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
     const char term = w->s->cfg->null_sep ? '\0' : '\n';
 
     if (json) {
-        /* Six bytes is the worst case per byte (\u00XX), and file names really
-           do contain newlines and tabs -- escaping only " and \ produced JSON
-           that no parser would accept. */
+        /* Six bytes per byte is the worst case (\u00XX). */
         if (w->olen + 6 * len + 16 > OBUF_SZ) buf_flush(w);
         buf_add(w->obuf, &w->olen, "{\"path\":\"", 9);
         for (i64 i = 0; i < len; i++) {
@@ -287,11 +271,8 @@ static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
     if (w->s->cfg->tty_out) buf_flush(w);
 }
 
-/* {} expands to a single-quoted path, with any embedded quote closed, escaped
-   and reopened ('\''). Pasting the raw name in let a file called `a; rm -rf x`
-   run whatever it liked, and a name long enough to overflow buf used to be
-   truncated and executed anyway -- half a command is more dangerous than none,
-   so an overflow now refuses to run at all. */
+/* {} expands to a single-quoted path so a name like `a; rm -rf x` stays inert;
+   an overflow refuses to run rather than executing half a command. */
 static i64 exec_quote(char *buf, i64 cap, const char *cmd,
                       const char *path, i64 len) {
     i64 pos = 0;
@@ -364,11 +345,15 @@ static void consider(Scanner *s, Worker *w, i64 dirfd, const char *path,
         return;
     }
 
-    if (c->pattern && !match_name(name, nlen)) return;
+    if (c->pattern && !name_match(c->nm, name, nlen)) return;
     if (c->size_cmp && !size_pass(c, dirfd, name)) return;
     if (c->needle &&
         !search_file_at(dirfd, name, c->needle, c->needle_len,
                         w->rbuf, RBUF_SZ)) return;
+
+    if (c->max_results) {
+        if (atomic_xadd(&s->emitted, 1) >= c->max_results) { scan_finish(s); return; }
+    }
 
     w->c_matches++;
 
@@ -379,6 +364,9 @@ static void consider(Scanner *s, Worker *w, i64 dirfd, const char *path,
     } else {
         buf_emit(w, path, len, c->json_out);
     }
+
+    if (c->max_results && atomic_load(&s->emitted) >= c->max_results)
+        scan_finish(s);
 }
 
 static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
@@ -407,6 +395,7 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
     for (;;) {
         i64 n = syscall3(SYS_getdents64, fd, (long)dbuf, DBUF_SZ);
         if (n <= 0) break;
+        if (c->max_results && atomic_load(&s->done)) break;
 
         for (i64 pos = 0; pos < n; ) {
             struct linux_dirent64 *e = (struct linux_dirent64 *)(dbuf + pos);
@@ -416,6 +405,9 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
             if (name[0] == '.') {
                 if (name[1] == 0) continue;
                 if (name[1] == '.' && name[2] == 0) continue;
+                /* Dot entries only on request: otherwise a search under $HOME
+                   spends its time in ~/.cache. */
+                if (!c->hidden) continue;
             }
 
             u8 type = e->d_type;
@@ -429,6 +421,13 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
             if (c->use_ignore && gitignore_check(ign, name, is_dir)) continue;
 
             i64 nl = str_len(name);
+            /* Prunes directories too, so -E node_modules is never walked. */
+            if (c->n_ex) {
+                i64 skip = 0;
+                for (i64 k = 0; k < c->n_ex; k++)
+                    if (name_match(&c->ex[k], name, nl)) { skip = 1; break; }
+                if (skip) continue;
+            }
             if (prefix + nl >= PBUF_SZ) { flag_err(s, ERR_TOOLONG); continue; }
             for (i64 i = 0; i < nl; i++) pbuf[prefix + i] = name[i];
             i64 flen = prefix + nl;
@@ -467,6 +466,8 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
 static void worker_loop(Scanner *s, Worker *w) {
     for (;;) {
         DirRef d;
+
+        if (atomic_load(&s->done)) break;
 
         if (lstk_pop(w, &d) || q_pop(s, &d)) {
             scan_dir(s, w, &d);
@@ -595,12 +596,11 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char **roots, i64 nroots) {
     s->cfg = cfg;
     s->head = 0; s->tail = 0;
     s->active = 0; s->done = 0; s->work_gen = 0; s->idle = 0;
-    s->n_dirs = 0; s->n_files = 0; s->n_matches = 0;
+    s->n_dirs = 0; s->n_files = 0; s->n_matches = 0; s->emitted = 0;
     s->bar_live = 0; s->bar_exited = 0; s->err = 0;
     s->next_id = 1;   /* slot 0 belongs to the calling thread */
     s->spawned = 0;
-    /* Only the slots this run can use: clearing all 256 of them touched 16 KB
-       of pages that nothing else in the process ever reads. */
+    /* Only the slots this run can use; all 256 meant 16 KB of dead pages. */
     for (i64 i = 0; i < cfg->num_workers; i++) {
         s->wc[i].dirs = 0; s->wc[i].files = 0; s->wc[i].matches = 0;
     }
@@ -609,8 +609,7 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char **roots, i64 nroots) {
 
     if (bump_init(&s->arena, ARENA_CAP) < 0) { s->err = ERR_FATAL; return 0; }
 
-    /* Every root goes in before any worker starts, so each one is scanned with
-       its own depth origin and the pool balances across all of them at once. */
+    /* All roots go in before any worker starts: own depth origin for each. */
     i64 seeded = 0;
     for (i64 k = 0; k < nroots; k++) {
         const char *root = roots[k];

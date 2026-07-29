@@ -21,6 +21,7 @@ static int  g_type_filter;
 static i64 g_size_cmp;
 static i64 g_size_val;
 static i64 g_max_depth = -1;
+static i64 g_max_results;
 static i64 g_json;
 static i64 g_null_sep;
 static i64 g_want_help;
@@ -31,7 +32,13 @@ static i64 g_in_config;
 static i64 g_color = 1;          /* 0 never, 1 auto, 2 always */
 static i64 g_case = CASE_SMART;
 static i64 g_quiet_errs;         /* --no-messages */
+static i64 g_hidden;             /* -H/--hidden */
 static i64 g_force_glob;         /* -g: anchor the pattern to the whole name */
+static NameMatcher g_nm;
+static NameMatcher g_ex[MAX_EXCLUDES];
+static const char *g_ex_pat[MAX_EXCLUDES];
+static i64 g_n_ex;
+static i64 g_too_many_ex;
 
 /* Resolved per stream: help goes to stdout, the bar and summary to stderr,
    and either can be a terminal while the other is a pipe. */
@@ -160,13 +167,8 @@ static i64 load_config(char **envp) {
     return cfg_argc;
 }
 
-/* The first bare word is the pattern, anything that looks like a location is a
-   root, and every further argument is another root. After '--' a leading '-'
-   also means "root": that is the whole reason to write '--', and a pattern
-   starting with a dash can still go through -n.
-
-   Extra arguments used to be dropped on the floor, so `crom '*.sh' src tests`
-   quietly searched only src and reported nothing. */
+/* First bare word is the pattern, everything else is a root. After '--' a
+   leading '-' means "root" too; a dashed pattern can still go through -n. */
 static void add_root(const char *arg) {
     if (n_roots < MAX_ROOTS) roots[n_roots++] = arg;
     else g_too_many_roots = 1;
@@ -198,6 +200,13 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
         if (i + 1 < ac) pattern = av[++i];
         g_force_glob = 1; *pi = i; return;
     }
+    if (str_eq(arg, "-E") || str_eq(arg, "--exclude")) {
+        if (i + 1 < ac) {
+            if (g_n_ex < MAX_EXCLUDES) g_ex_pat[g_n_ex++] = av[++i];
+            else { i++; g_too_many_ex = 1; }
+        }
+        *pi = i; return;
+    }
     if (str_eq(arg, "-i") || str_eq(arg, "--ignore-case")) {
         g_case = CASE_IGNORE; *pi = i; return;
     }
@@ -218,6 +227,9 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
     if (str_eq(arg, "-s") || str_eq(arg, "--size")) {
         if (i + 1 < ac) g_size_val = parse_size(av[++i]); *pi = i; return;
     }
+    if (str_eq(arg, "--max-results")) {
+        if (i + 1 < ac) g_max_results = parse_int(av[++i]); *pi = i; return;
+    }
     if (str_eq(arg, "--depth")) {
         if (i + 1 < ac) g_max_depth = parse_int(av[++i]); *pi = i; return;
     }
@@ -226,6 +238,10 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
     if (str_eq(arg, "-a") || str_eq(arg, "--text")) { g_binary = 1; *pi = i; return; }
     if (str_eq(arg, "-0") || str_eq(arg, "--null")) { g_null_sep = 1; *pi = i; return; }
     if (str_eq(arg, "--no-ignore")) { g_use_ignore = 0; *pi = i; return; }
+    if (str_eq(arg, "-H") || str_eq(arg, "--hidden")) { g_hidden = 1; *pi = i; return; }
+    if (str_eq(arg, "-u") || str_eq(arg, "--unrestricted")) {
+        g_hidden = 1; g_use_ignore = 0; *pi = i; return;
+    }
     if (str_eq(arg, "--no-messages")) { g_quiet_errs = 1; *pi = i; return; }
     if (str_eq(arg, "--no-config")) { *pi = i; return; }
     if (str_eq(arg, "--json")) { g_json = 1; *pi = i; return; }
@@ -296,6 +312,11 @@ int crom_main(int argc, char **argv, char **envp) {
         return 2;
     }
 
+    if (g_too_many_ex) {
+        write_str(STDERR_FILENO, prog);
+        write_str(STDERR_FILENO, ": too many --exclude patterns\n");
+        return 2;
+    }
     if (g_too_many_roots) {
         write_str(STDERR_FILENO, prog);
         write_str(STDERR_FILENO, ": too many search paths\n");
@@ -309,12 +330,27 @@ int crom_main(int argc, char **argv, char **envp) {
 
     if (g_bar) g_bar = display_init(color_on(STDERR_FILENO));
     ignore_set_enabled(g_use_ignore);
-    name_prepare(pattern, g_case, g_force_glob);
-    if (needle) content_prepare(needle, needle_len);
+    name_compile(&g_nm, pattern, g_case, g_force_glob);
+    /* Excludes are whole-name globs: -E build must not hide buildfile.c. */
+    for (i64 i = 0; i < g_n_ex; i++)
+        name_compile(&g_ex[i], g_ex_pat[i], g_case, 1);
+    /* Same smart-case rule as names. */
+    if (needle) {
+        i64 icase = (g_case == CASE_IGNORE);
+        if (g_case == CASE_SMART) {
+            icase = 1;
+            for (const char *p = needle; *p; p++)
+                if (*p >= 'A' && *p <= 'Z') { icase = 0; break; }
+        }
+        content_prepare(needle, needle_len, icase);
+    }
     content_set_text_only(!g_binary);
 
     ScanCfg cfg;
     cfg.pattern     = pattern;
+    cfg.nm          = &g_nm;
+    cfg.ex          = g_ex;
+    cfg.n_ex        = g_n_ex;
     cfg.needle      = needle;
     cfg.needle_len  = needle_len;
     cfg.exec_cmd    = g_exec_cmd;
@@ -322,16 +358,17 @@ int crom_main(int argc, char **argv, char **envp) {
     cfg.size_cmp    = g_size_cmp;
     cfg.size_val    = g_size_val;
     cfg.max_depth   = g_max_depth;
+    cfg.max_results = g_max_results;
     cfg.json_out    = g_json;
     cfg.null_sep    = g_null_sep;
     cfg.use_ignore  = g_use_ignore;
+    cfg.hidden      = g_hidden;
     cfg.quiet_errs  = g_quiet_errs;
     cfg.bar         = g_bar;
     cfg.tty_out     = is_tty(STDOUT_FILENO);
     cfg.num_workers = num_threads;
 
-    /* Check the roots up front, as find does: name every bad one, keep going
-       with the rest, and only fail outright when none of them is usable. */
+    /* Name every bad root, keep the rest, fail only if none is usable. */
     i64 usable = 0, bad = 0;
     for (i64 i = 0; i < n_roots; i++) {
         i64 rfd = syscall3(SYS_openat, AT_FDCWD, (long)roots[i],
@@ -367,9 +404,7 @@ int crom_main(int argc, char **argv, char **envp) {
         return 2;
     }
 
-    /* A short answer that looks complete is the worst outcome, so say it. An
-       unreadable directory is common enough to be only a warning per path
-       (already printed); the rest mean whole subtrees are missing. */
+    /* Whole subtrees missing: say so rather than look complete. */
     if (scanner.err & (ERR_ARENA|ERR_TOOLONG|ERR_EXEC)) {
         if (!g_quiet_errs) {
             write_str(STDERR_FILENO, prog);
@@ -383,8 +418,7 @@ int crom_main(int argc, char **argv, char **envp) {
         }
         return 2;
     }
-    /* ERR_OPENDIR deliberately does not change the exit code: scanning any
-       large tree as a normal user hits a directory it may not read, and every
-       one of them was already named on stderr. */
+    /* ERR_OPENDIR keeps the exit code: any big tree has unreadable corners,
+       and each was already named on stderr. */
     return g_matches > 0 ? 0 : 1;   /* grep convention: 1 == no matches */
 }
