@@ -51,8 +51,20 @@ bench-compare: $(TARGET)
 	@bash tests/bench.sh --compare
 
 install: $(TARGET)
-	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/crom
+	install -Dm755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/crom
+	install -Dm644 doc/crom.1 $(DESTDIR)$(PREFIX)/share/man/man1/crom.1
+	install -Dm644 LICENSE $(DESTDIR)$(PREFIX)/share/licenses/crom/LICENSE
+	install -Dm644 completions/crom.bash \
+	    $(DESTDIR)$(PREFIX)/share/bash-completion/completions/crom
+	install -Dm644 completions/_crom \
+	    $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_crom
+	install -Dm644 completions/crom.fish \
+	    $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/crom.fish
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/crom
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/crom.1
+	rm -rf $(DESTDIR)$(PREFIX)/share/licenses/crom
+	rm -f $(DESTDIR)$(PREFIX)/share/bash-completion/completions/crom
+	rm -f $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_crom
+	rm -f $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/crom.fish

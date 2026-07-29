@@ -1,0 +1,188 @@
+.TH CROM 1 "2026-07-30" "crom 0.3.0" "User Commands"
+.SH NAME
+crom \- find files by name or content, in parallel
+.SH SYNOPSIS
+.B crom
+[\fIoptions\fR] [\fIpattern\fR] [\fIpath\fR...]
+.SH DESCRIPTION
+.B crom
+walks one or more directory trees and prints the paths that match. A file
+matches when its name matches the pattern and, if
+.B \-c
+is given, its contents contain the given text.
+.PP
+With no path, the current directory is searched. With no pattern, every file
+matches. Paths beginning with
+.B \-
+must come after
+.BR \-\- .
+.SS Patterns
+A pattern without
+.BR * ", " ? " or " [
+matches any name that
+.I contains
+it. A pattern with any of those characters is a glob matched against the
+.I whole
+name.
+.B \-g
+forces the whole-name reading for a plain word.
+.PP
+Case folding follows the pattern: the match ignores case until the pattern
+itself contains a capital letter, so
+.B crom pdf
+finds
+.I notes.PDF
+but
+.B crom PDF
+does not. This applies to
+.B \-c
+as well.
+.SS Skipped by default
+Dot files and directories, everything excluded by a
+.I .gitignore
+in scope, and a built-in list of directories
+.RI ( .git ", " node_modules ", " __pycache__ ", " build ,
+and similar). See
+.BR \-H ", " \-\-no\-ignore " and " \-u .
+.SH OPTIONS
+.TP
+.BR \-n ", " \-\-name " \fIpattern\fR"
+Filename pattern, as if given positionally.
+.TP
+.BR \-g ", " \-\-glob " \fIpattern\fR"
+Match the whole name rather than a part of it.
+.TP
+.BR \-i ", " \-\-ignore\-case
+Fold case in names and in content.
+.TP
+.B \-\-case\-sensitive
+Match exactly as typed.
+.TP
+.BR \-E ", " \-\-exclude " \fIglob\fR"
+Skip entries whose name matches \fIglob\fR. Directories are pruned, not walked.
+May be given up to 32 times.
+.TP
+.BR \-c ", " \-\-content " \fItext\fR"
+Only report files whose contents contain \fItext\fR. Binary files are skipped
+unless
+.B \-a
+is given.
+.TP
+.BR \-t ", " \-\-type " \fIf\fR|\fId\fR|\fIl\fR"
+Report only regular files, directories or symlinks. The default is regular
+files.
+.TP
+.BR \-s ", " \-\-size " [+|\-]\fIN\fR"
+Only files larger (+) or smaller (\-) than \fIN\fR bytes. Suffixes
+.IR k ", " m ", " g
+multiply by 1024, 1048576 and 1073741824.
+.TP
+.BR \-H ", " \-\-hidden
+Descend into and report dot files and directories.
+.TP
+.BR \-u ", " \-\-unrestricted
+Shorthand for
+.B \-\-hidden \-\-no\-ignore .
+.TP
+.BR \-L ", " \-\-follow
+Follow symlinks to directories. A directory already on the current path is not
+entered again, so cycles terminate.
+.TP
+.BI \-\-depth " N"
+Do not descend more than \fIN\fR levels below each search path.
+.TP
+.BI \-\-max\-results " N"
+Stop the search once \fIN\fR matches have been printed.
+.TP
+.BR \-e ", " \-\-exec " \fIcommand\fR"
+Run \fIcommand\fR with
+.B {}
+replaced by each match. The path is passed single-quoted, so shell
+metacharacters in file names are inert. A command that would exceed the path
+buffer is not run.
+.TP
+.BR \-j ", " \-\-threads " \fIN\fR"
+Worker threads. Defaults to the number of usable cores.
+.TP
+.BR \-a ", " \-\-text
+Search binary files too.
+.TP
+.BR \-0 ", " \-\-null
+Terminate each result with NUL instead of a newline, for
+.BR "xargs \-0" .
+.TP
+.B \-\-json
+Print one JSON object per result.
+.TP
+.B \-\-bar
+Show a progress bar on stderr once the search passes 250 ms.
+.TP
+.BR \-q ", " \-\-no\-bar
+Never show the bar.
+.TP
+.B \-\-no\-ignore
+Do not read
+.I .gitignore
+files.
+.TP
+.B \-\-no\-messages
+Do not report paths that could not be opened.
+.TP
+.B \-\-no\-config
+Do not read
+.IR ~/.cromrc .
+.TP
+.BI \-\-color " when"
+.IR auto ", " always " or " never .
+.I auto
+colours only a terminal.
+.TP
+.BR \-h ", " \-\-help
+Print the option list.
+.TP
+.BR \-V ", " \-\-version
+Print the version.
+.SH EXIT STATUS
+.TP
+.B 0
+Something matched.
+.TP
+.B 1
+Nothing matched.
+.TP
+.B 2
+A named search path could not be opened, an option was not understood, or the
+results are incomplete.
+.PP
+Directories that could not be read during the walk are reported on stderr but do
+not change the exit status.
+.SH FILES
+.TP
+.I ~/.cromrc
+Default options, one or more per line.
+.B #
+begins a comment.
+.SH EXAMPLES
+.TP
+.B crom pdf
+Every name containing "pdf", in the current tree.
+.TP
+.B crom '*.rs' src tests
+Rust files under two directories.
+.TP
+.B crom \-c TODO \-n '*.py'
+Python files that mention TODO.
+.TP
+.B crom \-0 '*.tmp' | xargs \-0 rm
+Delete matches safely, whatever the names contain.
+.TP
+.B crom \-\-max\-results 1 config.toml /
+The first config.toml on the system, without walking the rest.
+.SH LIMITATIONS
+Linux on x86\-64 only. Paths longer than 4096 bytes are skipped and reported.
+Patterns are globs, not regular expressions.
+.SH SEE ALSO
+.BR find (1),
+.BR grep (1),
+.BR fd (1),
+.BR rg (1)

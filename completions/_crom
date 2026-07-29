@@ -1,0 +1,36 @@
+#compdef crom
+# zsh completion for crom
+
+_crom() {
+    _arguments -s -S \
+        '(-n --name)'{-n,--name}'[filename pattern]:pattern:' \
+        '(-g --glob)'{-g,--glob}'[match the whole name]:pattern:' \
+        '(-i --ignore-case)'{-i,--ignore-case}'[fold case]' \
+        '--case-sensitive[match as typed]' \
+        \*{-E,--exclude}'[skip names matching glob]:glob:' \
+        '(-c --content)'{-c,--content}'[search file contents]:text:' \
+        '(-t --type)'{-t,--type}'[filter by type]:type:((f\:"regular file" d\:directory l\:symlink))' \
+        '(-s --size)'{-s,--size}'[filter by size]:size ([+-]N):' \
+        '(-H --hidden)'{-H,--hidden}'[include dot entries]' \
+        '(-u --unrestricted)'{-u,--unrestricted}'[hidden and no ignore files]' \
+        '(-L --follow)'{-L,--follow}'[follow symlinked directories]' \
+        '--depth[max recursion depth]:levels:' \
+        '--max-results[stop after N matches]:count:' \
+        '(-e --exec)'{-e,--exec}'[run command per result]:command:' \
+        '(-j --threads)'{-j,--threads}'[worker threads]:count:' \
+        '(-a --text)'{-a,--text}'[search binary files too]' \
+        '(-0 --null)'{-0,--null}'[NUL-separated output]' \
+        '--json[JSON output]' \
+        '(--bar -q --no-bar)--bar[progress bar]' \
+        '(--bar -q --no-bar)'{-q,--no-bar}'[no progress bar]' \
+        '--no-ignore[do not read .gitignore]' \
+        '--no-messages[do not report unreadable paths]' \
+        '--no-config[skip ~/.cromrc]' \
+        '--color[when to colour]:when:(auto always never)' \
+        '(- *)'{-h,--help}'[show help]' \
+        '(- *)'{-V,--version}'[print version]' \
+        '1:pattern:' \
+        '*:path:_files -/'
+}
+
+_crom "$@"
