@@ -267,7 +267,7 @@ static i64 size_pass(const ScanCfg *c, i64 dirfd, const char *name) {
 }
 
 static void consider(Scanner *s, Worker *w, i64 dirfd, const char *path,
-                     i64 len, const char *name, u8 type) {
+                     i64 len, const char *name, i64 nlen, u8 type) {
     const ScanCfg *c = s->cfg;
 
     if (c->type_filter) {
@@ -278,7 +278,7 @@ static void consider(Scanner *s, Worker *w, i64 dirfd, const char *path,
         return;
     }
 
-    if (c->pattern && !match_glob(c->pattern, name)) return;
+    if (c->pattern && !match_name(name, nlen)) return;
     if (c->size_cmp && !size_pass(c, dirfd, name)) return;
     if (c->needle &&
         !search_file_at(dirfd, name, c->needle, c->needle_len,
@@ -360,7 +360,7 @@ static void scan_dir(Scanner *s, Worker *w, const DirRef *d) {
                 if ((w->c_files & 511) == 0) wc_publish(w);
             }
 
-            consider(s, w, fd, pbuf, flen, name, type);
+            consider(s, w, fd, pbuf, flen, name, nl, type);
         }
     }
 

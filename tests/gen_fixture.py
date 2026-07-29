@@ -103,6 +103,20 @@ def correctness(d):
     w(f"{d}/-dashdir/inside.txt", NEEDLE + b"\n")
     meta["N_DASHDIR"] = 1
 
+    # -- names for the matcher: substring, smart case, anchoring -------------
+    # Deliberately empty so this subtree cannot disturb any content counts.
+    for p in ("Makefile", "makefile.old", "notes.PDF", "paper.pdf",
+              "sub/MyPdfFile.txt", "file", "myfile.c", "profile"):
+        w(f"{d}/names/{p}", b"")
+    meta["N_PDF_ANY"] = 3              # notes.PDF paper.pdf sub/MyPdfFile.txt
+    meta["N_PDF_STRICT"] = 1           # 'PDF' has a capital: notes.PDF only
+    meta["N_FILE_ANY"] = 6             # file Makefile makefile.old myfile.c
+    meta["N_FILE_WHOLE"] = 1           #   profile MyPdfFile.txt / just `file`
+    meta["N_GLOB_PDF"] = 2             # *.pdf folded: notes.PDF paper.pdf
+    meta["N_GLOB_PDF_CS"] = 1          # *.pdf strict: paper.pdf
+    meta["N_MAKE_CAP"] = 2             # 'M*' strict: Makefile MyPdfFile.txt
+    meta["N_NAMES_TOTAL"] = 8
+
     # -- sizes for -s --------------------------------------------------------
     for i, size in enumerate((10, 5000, 200000)):
         w(f"{d}/sizes/s{i}.dat", b"a" * size)

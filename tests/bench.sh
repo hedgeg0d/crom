@@ -94,8 +94,33 @@ name_case() {                       # <label> <crom args...> -- reference sets
     fi
     printf '\n'
 }
+# The default reading of a bare pattern: a case-folded substring of the name,
+# which is also fd's native mode -- so here fd runs without -g.
+word_case() {
+    local label=$1 word=$2
+    local c_n; c_n=$(crom "$word" "$F" | wc -l)
+    row "$label"
+    cell "$(median_ms "$RUNS" "$CROM" --no-config "$word" "$F")"
+    if [ "$COMPARE" = 1 ]; then
+        local fargs=(-type f -iname "*$word*")
+        verify "find"  "$c_n" "$(command find "$F" "${fargs[@]}" | wc -l)"
+        cell "$(median_ms "$RUNS" command find "$F" "${fargs[@]}")"
+        if [ -n "$RFIND" ]; then
+            verify "find-rs" "$c_n" "$("$RFIND" "$F" "${fargs[@]}" 2>/dev/null | wc -l)"
+            cell "$(median_ms "$RUNS" "$RFIND" "$F" "${fargs[@]}")"
+        else cell "-"; fi
+        if [ -n "$FD" ]; then
+            local fdargs=(--type f --hidden --no-ignore "$word")
+            verify "$FD" "$c_n" "$("$FD" "${fdargs[@]}" "$F" 2>/dev/null | wc -l)"
+            cell "$(median_ms "$RUNS" "$FD" "${fdargs[@]}" "$F")"
+        else cell "-"; fi
+    fi
+    printf '\n'
+}
+
 name_case "glob  *.txt" '*.txt'
 name_case "every file"  '*'
+word_case "bare word  f01" 'f01'
 
 # ------------------------------------------------------------- by content
 

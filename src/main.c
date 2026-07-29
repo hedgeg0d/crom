@@ -29,6 +29,8 @@ static const char *g_bad_arg;      /* first unrecognized -flag, if any */
 static i64 g_bad_from_config;
 static i64 g_in_config;
 static i64 g_color = 1;          /* 0 never, 1 auto, 2 always */
+static i64 g_case = CASE_SMART;
+static i64 g_force_glob;         /* -g: anchor the pattern to the whole name */
 
 /* Resolved per stream: help goes to stdout, the bar and summary to stderr,
    and either can be a terminal while the other is a pipe. */
@@ -47,23 +49,29 @@ static void usage(void) {
     i64 c = color_on(STDOUT_FILENO);
     write_str_c(STDOUT_FILENO, "\033[1;36mcrom\033[0m — fast file hunter\n\n", c);
     write_str_c(STDOUT_FILENO, "  \033[1mcrom\033[0m [pattern] [path]\n\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-n\033[0m, \033[33m--name\033[0m <glob>     filename pattern\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-c\033[0m, \033[33m--content\033[0m <t>    search contents\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-t\033[0m, \033[33m--type\033[0m <f|d|l>   filter by type\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-s\033[0m, \033[33m--size\033[0m <[+-]N>   filter by size\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m--depth\033[0m <N>         max recursion depth\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-e\033[0m, \033[33m--exec\033[0m <cmd> {}  run command per result\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-j\033[0m, \033[33m--threads\033[0m <N>   worker threads\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-a\033[0m, \033[33m--text\033[0m          search binary files\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-0\033[0m, \033[33m--null\033[0m          null-separated output\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m--json\033[0m             JSON output\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m--bar\033[0m              progress bar\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-q\033[0m, \033[33m--no-bar\033[0m        quiet, no progress bar\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m--no-ignore\033[0m         skip .gitignore\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m--no-config\033[0m         skip config file\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m--color\033[0m <when>      auto|always|never\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-h\033[0m, \033[33m--help\033[0m          show help\n", c);
-    write_str_c(STDOUT_FILENO, "  \033[33m-V\033[0m, \033[33m--version\033[0m       print version\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[2ma bare word matches any name containing it; * ? or [ make the\n", c);
+    write_str_c(STDOUT_FILENO, "  pattern a glob over the whole name. Either form folds case until the\n", c);
+    write_str_c(STDOUT_FILENO, "  pattern itself carries a capital. -c is always case-sensitive.\033[0m\n\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-n\033[0m, \033[33m--name\033[0m <pat>      filename pattern\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-g\033[0m, \033[33m--glob\033[0m <pat>      match the whole name, not a part\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-i\033[0m, \033[33m--ignore-case\033[0m     fold case in names\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--case-sensitive\033[0m      match names as typed\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-c\033[0m, \033[33m--content\033[0m <t>     search contents\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-t\033[0m, \033[33m--type\033[0m <f|d|l>    filter by type\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-s\033[0m, \033[33m--size\033[0m <[+-]N>    filter by size\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--depth\033[0m <N>           max recursion depth\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-e\033[0m, \033[33m--exec\033[0m <cmd> {}   run command per result\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-j\033[0m, \033[33m--threads\033[0m <N>     worker threads\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-a\033[0m, \033[33m--text\033[0m            search binary files\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-0\033[0m, \033[33m--null\033[0m            null-separated output\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--json\033[0m                JSON output\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--bar\033[0m                 progress bar\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-q\033[0m, \033[33m--no-bar\033[0m          quiet, no progress bar\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--no-ignore\033[0m           skip .gitignore\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--no-config\033[0m           skip config file\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m--color\033[0m <when>        auto|always|never\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-h\033[0m, \033[33m--help\033[0m            show help\n", c);
+    write_str_c(STDOUT_FILENO, "  \033[33m-V\033[0m, \033[33m--version\033[0m         print version\n", c);
     write_str_c(STDOUT_FILENO, "\n  \033[2mpaths starting with '-' go after \033[0m--\n", c);
     write_str_c(STDOUT_FILENO, "\n  \033[1mexit\033[0m  \033[32m0\033[0m found  \033[32m1\033[0m none  \033[32m2\033[0m error\n", c);
 }
@@ -174,6 +182,14 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
     if (str_eq(arg, "-n") || str_eq(arg, "--name")) {
         if (i + 1 < ac) pattern = av[++i]; *pi = i; return;
     }
+    if (str_eq(arg, "-g") || str_eq(arg, "--glob")) {
+        if (i + 1 < ac) pattern = av[++i];
+        g_force_glob = 1; *pi = i; return;
+    }
+    if (str_eq(arg, "-i") || str_eq(arg, "--ignore-case")) {
+        g_case = CASE_IGNORE; *pi = i; return;
+    }
+    if (str_eq(arg, "--case-sensitive")) { g_case = CASE_SENSITIVE; *pi = i; return; }
     if (str_eq(arg, "-c") || str_eq(arg, "--content")) {
         if (i + 1 < ac) { needle = av[++i]; needle_len = str_len(needle); }
         *pi = i; return;
@@ -275,6 +291,7 @@ int crom_main(int argc, char **argv, char **envp) {
 
     if (g_bar) g_bar = display_init(color_on(STDERR_FILENO));
     ignore_set_enabled(g_use_ignore);
+    name_prepare(pattern, g_case, g_force_glob);
     if (needle) content_prepare(needle, needle_len);
     content_set_text_only(!g_binary);
 
