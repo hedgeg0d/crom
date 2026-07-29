@@ -25,6 +25,9 @@ static i64 g_json;
 static i64 g_null_sep;
 static i64 g_want_help;
 static i64 g_want_version;
+static const char *g_bad_arg;      /* first unrecognized -flag, if any */
+static i64 g_bad_from_config;
+static i64 g_in_config;
 static i64 g_color = 1;          /* 0 never, 1 auto, 2 always */
 
 /* Resolved per stream: help goes to stdout, the bar and summary to stderr,
@@ -61,6 +64,7 @@ static void usage(void) {
     write_str_c(STDOUT_FILENO, "  \033[33m--color\033[0m <when>      auto|always|never\n", c);
     write_str_c(STDOUT_FILENO, "  \033[33m-h\033[0m, \033[33m--help\033[0m          show help\n", c);
     write_str_c(STDOUT_FILENO, "  \033[33m-V\033[0m, \033[33m--version\033[0m       print version\n", c);
+    write_str_c(STDOUT_FILENO, "\n  \033[2mpaths starting with '-' go after \033[0m--\n", c);
     write_str_c(STDOUT_FILENO, "\n  \033[1mexit\033[0m  \033[32m0\033[0m found  \033[32m1\033[0m none  \033[32m2\033[0m error\n", c);
 }
 
@@ -144,15 +148,24 @@ static i64 load_config(char **envp) {
     return cfg_argc;
 }
 
+/* A bare word is a glob, anything that looks like a location is the path.
+   After '--' a leading '-' also means "path": that is the whole reason to
+   write '--', and a glob starting with a dash can still go through -n. */
+static void positional(const char *arg) {
+    if (arg[0] == '/' || arg[0] == '.' || arg[0] == '~' || arg[0] == '-') {
+        if (!target) target = arg;
+        else if (!pattern) pattern = arg;
+    } else {
+        if (!pattern) pattern = arg;
+        else if (!target) target = arg;
+    }
+}
+
 static void parse_arg(const char *arg, int ac, char **av, int *pi) {
     int i = *pi;
 
     if (!saw_dash && str_eq(arg, "--")) { saw_dash = 1; *pi = i; return; }
-    if (saw_dash) {
-        if (!pattern) pattern = arg;
-        else if (!target) target = arg;
-        *pi = i; return;
-    }
+    if (saw_dash) { positional(arg); *pi = i; return; }
 
     if (str_eq(arg, "-h") || str_eq(arg, "--help")) { g_want_help = 1; *pi = i; return; }
     if (str_eq(arg, "-V") || str_eq(arg, "--version")) {
@@ -200,12 +213,15 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
         if (i + 1 < ac) g_exec_cmd = av[++i]; *pi = i; return;
     }
     if (arg[0] != '-') {
-        if (arg[0] == '/' || arg[0] == '.' || arg[0] == '~') {
-            if (!target) target = arg;
-        } else {
-            if (!pattern) pattern = arg;
-        }
+        positional(arg);
+        *pi = i;
+        return;
     }
+
+    /* Falling through here used to mean the argument was silently dropped, so
+       a typo like --jsom just quietly turned the option off. Report the first
+       one; paths that really start with '-' can be passed after '--'. */
+    if (!g_bad_arg) { g_bad_arg = arg; g_bad_from_config = g_in_config; }
     *pi = i;
 }
 
@@ -226,8 +242,12 @@ int crom_main(int argc, char **argv, char **envp) {
 
     if (!no_cfg) {
         i64 ca = load_config(envp);
-        if (ca > 0)
+        if (ca > 0) {
+            g_in_config = 1;
             for (int i = 0; i < (int)ca; i++) parse_arg(cfg_argv[i], (int)ca, cfg_argv, &i);
+            g_in_config = 0;
+            saw_dash = 0;      /* a '--' in the config must not swallow argv */
+        }
     }
 
     for (int i = 1; i < argc; i++)
@@ -235,6 +255,17 @@ int crom_main(int argc, char **argv, char **envp) {
 
     if (g_want_help)    { usage(); return 0; }
     if (g_want_version) { write_str(STDOUT_FILENO, "crom 0.2.0\n"); return 0; }
+
+    if (g_bad_arg) {
+        write_str(STDERR_FILENO, prog);
+        write_str(STDERR_FILENO, ": unrecognized option '");
+        write_str(STDERR_FILENO, g_bad_arg);
+        write_str(STDERR_FILENO, g_bad_from_config ? "' in config file\n" : "'\n");
+        write_str(STDERR_FILENO, "Try '");
+        write_str(STDERR_FILENO, prog);
+        write_str(STDERR_FILENO, " --help' for more information.\n");
+        return 2;
+    }
 
     if (!target) target = ".";
     if (!pattern && !needle) pattern = "*";

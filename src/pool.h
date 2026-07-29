@@ -65,6 +65,7 @@ typedef struct {
     volatile i64 bar_live;
     volatile i64 bar_exited;
     volatile i64 next_id;
+    volatile i64 spawned;     /* worker threads created so far (lazily) */
     volatile i64 err;         /* fatal: no arena, root unreadable */
 } Scanner;
 

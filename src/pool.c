@@ -128,10 +128,26 @@ static void scan_finish(Scanner *s) {
              FUTEX_WAKE|FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
 }
 
+static i64 spawn_thread(i64 (*fn)(void *), void *arg);
+static i64 worker_main(void *arg);
+
+/* Threads are created only once the shared ring actually holds work for
+   someone else. A search that finishes inside one directory never pays for a
+   single clone(), which was most of the fixed startup cost. */
+static void maybe_spawn(Scanner *s) {
+    i64 want = s->cfg->num_workers - 1;          /* the caller is worker 0 */
+    if (want <= 0 || atomic_load(&s->spawned) >= want) return;
+    if (atomic_load(&s->head) - atomic_load(&s->tail) < 2) return;
+
+    if (atomic_xadd(&s->spawned, 1) >= want) return;   /* lost the race */
+    if (spawn_thread(worker_main, s) == 0) atomic_xadd(&s->workers_live, 1);
+}
+
 static void publish(Scanner *s, Worker *w, const DirRef *d) {
     atomic_xadd(&s->active, 1);
     if (q_push(s, d)) {
         atomic_xadd(&s->work_gen, 1);
+        maybe_spawn(s);
         if (atomic_load(&s->idle) > 0) wake_all(s);
     } else if (!lstk_push(w, d)) {
         atomic_xadd(&s->active, -1);   /* arena exhausted */
@@ -444,6 +460,7 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     s->n_dirs = 0; s->n_files = 0; s->n_matches = 0;
     s->bar_live = 0; s->bar_exited = 0; s->err = 0;
     s->next_id = 1;   /* slot 0 belongs to the calling thread */
+    s->spawned = 0;
     for (i64 i = 0; i < SCAN_MAX_WORKERS; i++) {
         s->wc[i].dirs = 0; s->wc[i].files = 0; s->wc[i].matches = 0;
     }
@@ -465,9 +482,6 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     atomic_xadd(&s->active, 1);
     if (!q_push(s, &r)) { s->err = 1; return 0; }
 
-    for (i64 i = 1; i < cfg->num_workers; i++)
-        if (spawn_thread(worker_main, s) == 0) atomic_xadd(&s->workers_live, 1);
-
     if (cfg->bar && spawn_thread(bar_main, s) == 0)
         atomic_xadd(&s->bar_live, 1);
 
@@ -477,8 +491,9 @@ i64 scan_run(Scanner *s, const ScanCfg *cfg, const char *root) {
     wc_publish(&w);
     buf_flush(&w);
 
-    i64 live = atomic_load(&s->workers_live);
-    while (atomic_load(&s->workers_exited) < live) {
+    /* Re-read the count each turn: workers are spawned lazily, so one may
+       appear after we start waiting. */
+    while (atomic_load(&s->workers_exited) < atomic_load(&s->workers_live)) {
         scan_finish(s);
         syscall1(SYS_sched_yield, 0);
     }

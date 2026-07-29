@@ -25,7 +25,7 @@ build/%.o: $(SRCDIR)/%.S
 	@mkdir -p build
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
-.PHONY: clean run test install uninstall
+.PHONY: clean run test test-compare bench bench-compare install uninstall
 
 clean:
 	rm -rf build
@@ -34,7 +34,16 @@ run: $(TARGET)
 	$(TARGET) .
 
 test: $(TARGET)
-	$(TARGET) '*.c' 2>&1 || true
+	@bash tests/run.sh
+
+test-compare: $(TARGET)
+	@bash tests/run.sh --compare
+
+bench: $(TARGET)
+	@bash tests/bench.sh
+
+bench-compare: $(TARGET)
+	@bash tests/bench.sh --compare
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(PREFIX)/bin
