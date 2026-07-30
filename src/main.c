@@ -416,6 +416,9 @@ int crom_main(int argc, char **argv, char **envp) {
        other roots produced matches, which is how grep -r treats it. */
     if (bad) return 2;
 
+    /* Nothing to say: whatever was reading the output is gone. */
+    if (scanner.err & ERR_WRITE) return 2;
+
     if (scanner.err & ERR_FATAL) {
         write_str(STDERR_FILENO, prog);
         write_str(STDERR_FILENO, ": scan failed\n");

@@ -15,11 +15,13 @@ static inline i64 str_eq(const char *a, const char *b) {
     return *a == *b;
 }
 
+/* Returns the negative errno on failure: a caller that is writing results has
+   to know when the far end is gone. */
 static inline i64 write_all(i64 fd, const char *s, i64 len) {
     i64 off = 0;
     while (off < len) {
         i64 n = syscall3(SYS_write, fd, (long)(s + off), (unsigned long)(len - off));
-        if (n < 0) return -1;
+        if (n < 0) return n;
         off += n;
     }
     return off;

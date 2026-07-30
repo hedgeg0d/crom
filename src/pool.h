@@ -12,6 +12,7 @@
 #define ERR_ARENA     4   /* path arena exhausted, subtrees dropped */
 #define ERR_TOOLONG   8   /* path would exceed PBUF_SZ, subtree dropped */
 #define ERR_EXEC     16   /* -e command did not fit its buffer, not run */
+#define ERR_WRITE    32   /* stdout went away mid-scan */
 
 /* Shared backlog; overflow spills to the finder's own stack. */
 #define SCAN_QUEUE_CAP 1024

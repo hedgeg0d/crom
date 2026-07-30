@@ -113,8 +113,9 @@ is "--no-messages silences it" "0" bash -c "'$CROM' --no-config --no-messages -c
 head_ "symlinks"
 count "not followed by default" "$N_FOLLOW_PLAIN" crom -c "$NEEDLE" "$F/follow"
 count "-L follows"              "$N_FOLLOW_L"     crom -L -c "$NEEDLE" "$F/follow"
-count "-L terminates on a cycle" "$N_FOLLOW_L"    timeout 20 crom -L -c "$NEEDLE" "$F/follow"
-rc "-L exits cleanly"           0                 timeout 20 crom -L -c "$NEEDLE" "$F/follow"
+# timeout cannot run the crom shell function, so call the binary directly
+count "-L terminates on a cycle" "$N_FOLLOW_L" timeout 20 "$CROM" "${CROM_ARGS[@]}" -L -c "$NEEDLE" "$F/follow"
+rc "-L exits cleanly"            0             timeout 20 "$CROM" "${CROM_ARGS[@]}" -L -c "$NEEDLE" "$F/follow"
 
 head_ "exclude and limits"
 # an explicitly named root is always scanned, so excludes apply below it
@@ -141,8 +142,16 @@ print(\"ok\")'"
 is "-e cannot inject" "clean" bash -c "
   cd '$F/inject' && '$CROM' --no-config -H -e 'echo {} >/dev/null' '*' . >/dev/null 2>&1
   ls PWNED SUBST >/dev/null 2>&1 && echo pwned || echo clean"
-# bulk/ is large enough that crom must write more than one pipe buffer
-is "broken pipe exits 141" "141" bash -c "'$CROM' --no-config '*.dat' '$F/bulk' | head -1 >/dev/null; echo \${PIPESTATUS[0]}"
+# bulk/ is large enough that crom must write more than one pipe buffer.
+# 141 when SIGPIPE kills it, 2 when SIGPIPE is ignored (systemd does that to
+# its children, which is what CI runs under) and the write returns EPIPE.
+is "broken pipe stops the scan" "stopped" bash -c "
+  '$CROM' --no-config '*.dat' '$F/bulk' | head -1 >/dev/null
+  case \${PIPESTATUS[0]} in 141|2) echo stopped ;; *) echo \"rc=\${PIPESTATUS[0]}\" ;; esac"
+is "EPIPE without SIGPIPE exits 2" "2" bash -c "
+  trap '' PIPE
+  '$CROM' --no-config '*.dat' '$F/bulk' | head -1 >/dev/null
+  echo \${PIPESTATUS[0]}"
 
 head_ "gitignore"
 count "inherited into subdirs" "$N_GIT_VISIBLE" crom -c "$NEEDLE" "$F/git"

@@ -243,13 +243,20 @@ static void buf_add(char *buf, i64 *olen, const char *p, i64 plen) {
     for (i64 i = 0; i < plen; i++) buf[(*olen)++] = p[i];
 }
 
+/* A closed stdout normally kills us with SIGPIPE, but not when the parent
+   ignores it (systemd services do), so stop the search rather than walk the
+   rest of the tree writing into a dead pipe. */
 static void buf_flush(Worker *w) {
     if (w->olen <= 0) return;
     out_lock();
     if (w->s->cfg->bar) display_clear();
-    write_all(STDOUT_FILENO, w->obuf, w->olen);
+    i64 r = write_all(STDOUT_FILENO, w->obuf, w->olen);
     out_unlock();
     w->olen = 0;
+    if (r < 0) {
+        atomic_or(&w->s->err, ERR_WRITE);
+        scan_finish(w->s);
+    }
 }
 
 static void buf_emit(Worker *w, const char *path, i64 len, i64 json) {
