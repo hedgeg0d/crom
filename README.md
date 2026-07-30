@@ -153,6 +153,7 @@ quoted, so a file named `a; rm -rf ~` is inert.
 make test            # 105 checks against a generated tree
 make test-compare    # plus cross-checks against find, grep and rg
 make bench           # timings; bench-compare adds the other tools
+make bench-compare SCALE=4 RUNS=9   # bigger tree, more samples
 ```
 
 ## License

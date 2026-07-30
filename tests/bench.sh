@@ -6,6 +6,8 @@
 #   --compare   also time find/grep/rg on the same tree
 #   --scale N   tree size multiplier (default 1 ~ 6000 files, 48 MB)
 #   --runs N    timed runs per case, median reported (default 5)
+#
+# Through make:  make bench-compare SCALE=4 RUNS=9
 #   --keep      leave the tree in place and print its path
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -22,6 +24,10 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+case "$SCALE" in ''|*[!0-9]*) die "--scale takes a positive number, got '$SCALE'" ;; esac
+case "$RUNS"  in ''|*[!0-9]*) die "--runs takes a positive number, got '$RUNS'" ;; esac
+[ "$SCALE" -gt 0 ] || die "--scale must be at least 1"
+[ "$RUNS"  -gt 0 ] || die "--runs must be at least 1"
 [ -x "$CROM" ] || die "no binary at $CROM (run make first)"
 [ "$KEEP" = 1 ] && trap - EXIT INT TERM
 

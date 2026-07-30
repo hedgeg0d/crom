@@ -49,11 +49,14 @@ test: $(TARGET)
 test-compare: $(TARGET)
 	@bash tests/run.sh --compare
 
+# make bench-compare SCALE=4 RUNS=9, or BENCH_ARGS=--keep for the rest
+BENCH_FLAGS := $(if $(SCALE),--scale $(SCALE)) $(if $(RUNS),--runs $(RUNS)) $(BENCH_ARGS)
+
 bench: $(TARGET)
-	@bash tests/bench.sh
+	@bash tests/bench.sh $(BENCH_FLAGS)
 
 bench-compare: $(TARGET)
-	@bash tests/bench.sh --compare
+	@bash tests/bench.sh --compare $(BENCH_FLAGS)
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/crom
