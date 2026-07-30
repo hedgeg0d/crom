@@ -63,18 +63,22 @@ show_warnings() {
     for w in "${WARN[@]}"; do printf '  %swarning:%s %s\n' "$C_BAD" "$C_OFF" "$w"; done
 }
 
-row()  { printf '  %-24s' "$1"; }
-cell() { if [ "$1" = "-" ]; then printf '%12s' "-"; else printf '%10sms' "$1"; fi; }
+# One row under construction; cell appends to it, tbl_row commits it.
+ROW=()
+cell() { if [ "$1" = "-" ]; then ROW+=("-"); else ROW+=("${1}ms"); fi; }
 
 # ------------------------------------------------------------ by filename
 
 head_ "filename search (median of $RUNS runs)"
-printf '  %-24s%12s%12s%12s%12s\n' "case" "crom" "find" "find-rs" "fd"
+NAME_COLS=(case crom)
+[ "$COMPARE" = 1 ] && NAME_COLS+=(find find-rs fd)
+tbl_reset
+tbl_row "${NAME_COLS[@]}"
 
 name_case() {                       # <label> <crom args...> -- reference sets
     local label=$1 glob=$2
     local c_n; c_n=$(crom -n "$glob" "$F" | wc -l)
-    row "$label"
+    ROW=("$label")
     cell "$(median_ms "$RUNS" "$CROM" --no-config -n "$glob" "$F")"
     if [ "$COMPARE" = 1 ]; then
         local fargs=(-type f); [ "$glob" != '*' ] && fargs+=(-name "$glob")
@@ -92,14 +96,14 @@ name_case() {                       # <label> <crom args...> -- reference sets
             cell "$(median_ms "$RUNS" "$FD" "${fdargs[@]}" "$F")"
         else cell "-"; fi
     fi
-    printf '\n'
+    tbl_row "${ROW[@]}"
 }
 # The default reading of a bare pattern: a case-folded substring of the name,
 # which is also fd's native mode -- so here fd runs without -g.
 word_case() {
     local label=$1 word=$2
     local c_n; c_n=$(crom "$word" "$F" | wc -l)
-    row "$label"
+    ROW=("$label")
     cell "$(median_ms "$RUNS" "$CROM" --no-config "$word" "$F")"
     if [ "$COMPARE" = 1 ]; then
         local fargs=(-type f -iname "*$word*")
@@ -115,24 +119,28 @@ word_case() {
             cell "$(median_ms "$RUNS" "$FD" "${fdargs[@]}" "$F")"
         else cell "-"; fi
     fi
-    printf '\n'
+    tbl_row "${ROW[@]}"
 }
 
 name_case "glob  *.txt" '*.txt'
 name_case "every file"  '*'
 word_case "bare word  f01" 'f01'
+tbl_flush best
 
 # ------------------------------------------------------------- by content
 
 head_ "content search (median of $RUNS runs)"
-printf '  %-24s%12s%12s%12s\n' "case" "crom" "grep" "rg"
+CONTENT_COLS=(case crom)
+[ "$COMPARE" = 1 ] && CONTENT_COLS+=(grep rg)
+tbl_reset
+tbl_row "${CONTENT_COLS[@]}"
 
 for spec in "COMMON_TOKEN:40% of files" \
             "RARE_TOKEN_XYZ:rare token" \
             "NO_SUCH_TOKEN_ZZ:no match (reads all)"; do
     tok=${spec%%:*}; label=${spec#*:}
     c_n=$(crom -c "$tok" "$F" | wc -l)
-    row "$label"
+    ROW=("$label")
     cell "$(median_ms "$RUNS" "$CROM" --no-config -c "$tok" "$F")"
     if [ "$COMPARE" = 1 ]; then
         verify "grep" "$c_n" "$(GREP -rIl "$tok" "$F" 2>/dev/null | wc -l)"
@@ -142,27 +150,33 @@ for spec in "COMMON_TOKEN:40% of files" \
             cell "$(median_ms "$RUNS" rg -l --no-ignore --no-messages "$tok" "$F")"
         else cell "-"; fi
     fi
-    printf '\n'
+    tbl_row "${ROW[@]}"
 done
+tbl_flush best
 
 # --------------------------------------------------------------- scaling
 
 head_ "thread scaling (content, no match)"
 NPROC=$(nproc 2>/dev/null || echo 8)
 base=""
+tbl_reset
+tbl_row "threads" "time" "speedup"
 for j in 1 2 4 8 16; do
     [ "$j" -gt $((NPROC * 2)) ] && continue
     t=$(median_ms "$RUNS" "$CROM" --no-config -j "$j" -c NO_SUCH_TOKEN_ZZ "$F")
     [ -z "$base" ] && base=$t
-    printf '  -j %-3s %9sms   %sx%s%s\n' "$j" "$t" "$C_DIM" \
-        "$(awk "BEGIN{printf \"%.2f\", $base/$t}")" "$C_OFF"
+    tbl_row "-j $j" "${t}ms" "x$(awk "BEGIN{printf \"%.2f\", $base/$t}")"
 done
+tbl_flush
 
 show_warnings
 
 head_ "startup overhead"
 mkdir -p "$F/.empty"
-printf '  %-30s%9sms\n' "empty directory" "$(median_ms 40 "$CROM" --no-config -c x "$F/.empty")"
+tbl_reset
+tbl_row "case" "time"
+tbl_row "empty directory" "$(median_ms 40 "$CROM" --no-config -c x "$F/.empty")ms"
+tbl_flush
 
 [ "$KEEP" = 1 ] && printf '\n%stree kept: %s%s\n' "$C_DIM" "$F" "$C_OFF"
 printf '\n'

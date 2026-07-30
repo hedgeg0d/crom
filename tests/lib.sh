@@ -28,6 +28,66 @@ GREP() { command grep "$@"; }
 
 crom() { "$CROM" "${CROM_ARGS[@]}" "$@"; }
 
+# ------------------------------------------------------------------ tables
+
+# Rows are collected first so every column can be sized to its widest cell.
+# tbl_row takes one argument per column; the first row is the header.
+TBL=()
+tbl_reset() { TBL=(); }
+tbl_row() { local IFS=$'\x1f'; TBL+=("$*"); }
+
+_rep() { local n=$1 c=$2 out=; while [ "$n" -gt 0 ]; do out+=$c; n=$((n-1)); done; printf '%s' "$out"; }
+
+# tbl_flush [best]   "best" paints the lowest number in each data row green
+tbl_flush() {
+    local best=${1:-}
+    local -a w=() cells=()
+    local r i ncol=0
+
+    for r in "${TBL[@]}"; do
+        IFS=$'\x1f' read -r -a cells <<<"$r"
+        [ ${#cells[@]} -gt "$ncol" ] && ncol=${#cells[@]}
+        for ((i = 0; i < ${#cells[@]}; i++)); do
+            [ ${#cells[i]} -gt "${w[i]:-0}" ] && w[i]=${#cells[i]}
+        done
+    done
+    [ "$ncol" -eq 0 ] && return 0
+
+    local top="" mid="" bot="" bar
+    for ((i = 0; i < ncol; i++)); do
+        bar=$(_rep $((w[i] + 2)) '─')
+        if [ "$i" -eq 0 ]; then top="┌$bar"; mid="├$bar"; bot="└$bar"
+        else top+="┬$bar"; mid+="┼$bar"; bot+="┴$bar"; fi
+    done
+    top+="┐"; mid+="┤"; bot+="┘"
+
+    local n win pad
+    printf '  %s\n' "$top"
+    for ((n = 0; n < ${#TBL[@]}; n++)); do
+        IFS=$'\x1f' read -r -a cells <<<"${TBL[n]}"
+        win=-1
+        # With a single data column the winner is whoever is there: pointless.
+        if [ -n "$best" ] && [ "$n" -gt 0 ] && [ "$ncol" -gt 2 ]; then
+            win=$(printf '%s\n' "${cells[@]:1}" | awk '
+                { v = $0; sub(/ms$/, "", v)
+                  if (v ~ /^[0-9.]+$/ && (b == "" || v + 0 < b)) { b = v + 0; k = NR } }
+                END { print (k ? k : 0) }')
+        fi
+        printf '  │'
+        for ((i = 0; i < ncol; i++)); do
+            if [ "$i" -eq 0 ]; then pad=$(printf '%-*s' "${w[i]}" "${cells[i]:-}")
+            else pad=$(printf '%*s' "${w[i]}" "${cells[i]:-}"); fi
+            if [ "$i" -eq "$win" ]; then printf ' %s%s%s │' "$C_OK" "$pad" "$C_OFF"
+            elif [ "$n" -eq 0 ]; then printf ' %s%s%s │' "$C_HEAD" "$pad" "$C_OFF"
+            else printf ' %s │' "$pad"; fi
+        done
+        printf '\n'
+        [ "$n" -eq 0 ] && printf '  %s\n' "$mid"
+    done
+    printf '  %s\n' "$bot"
+    tbl_reset
+}
+
 # ---------------------------------------------------------------- fixtures
 
 # Temp tree is created under TMPDIR and removed on any exit, including Ctrl-C.
