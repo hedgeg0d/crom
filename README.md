@@ -1,7 +1,7 @@
 # crom
 
 A file hunter for Linux: finds files by name or by content, in parallel, with no
-libc between it and the kernel. One static binary, about 30 KB.
+libc between it and the kernel. One static binary, about 35 KB.
 
 ```
 crom pdf                  # every name containing "pdf", any case
