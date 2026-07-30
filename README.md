@@ -42,11 +42,13 @@ make
 sudo make install           # PREFIX=/usr/local by default
 ```
 
-`make` builds with `-march=native`, so the binary is tuned for the machine that
-built it and may not run on an older one. For a portable build:
+Both routes build with `-march=native`, so the binary is tuned for the machine
+that compiled it — which is the point of installing a source package. It may not
+run on an older CPU. For a portable build:
 
 ```
-make ARCH_FLAGS=-march=x86-64-v2
+make ARCH_FLAGS=-march=x86-64-v2       # from source
+_native=0 makepkg -si                  # from the PKGBUILD
 ```
 
 ## Patterns
