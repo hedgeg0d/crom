@@ -35,7 +35,7 @@ From the AUR:
 paru -S crom        # or: yay -S crom
 ```
 
-From source (needs clang and lld):
+From source (needs gcc, or clang with lld):
 
 ```
 make

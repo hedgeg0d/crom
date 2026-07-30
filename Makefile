@@ -1,10 +1,12 @@
 VERSION  := 0.3.0
 
-CC       := clang
+# gcc -O2 measured fastest here: 15% over clang -O3 on content search, and gcc
+# -O3 is both larger and slower than -O2 on this code.
+CC       := gcc
 # Tuned for the machine that builds it, which is the point of building from
 # source. Override for a portable binary: make ARCH_FLAGS=-march=x86-64-v2
 ARCH_FLAGS := -march=native
-CFLAGS   := -nostdlib -ffreestanding -static -O3 $(ARCH_FLAGS) -pipe \
+CFLAGS   := -nostdlib -ffreestanding -static -O2 $(ARCH_FLAGS) -pipe \
             -flto -fno-stack-protector -fno-pic \
             -fvisibility=hidden -ffunction-sections -fdata-sections \
             -DCROM_VERSION=\"$(VERSION)\" \

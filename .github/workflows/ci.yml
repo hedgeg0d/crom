@@ -13,11 +13,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cc: clang
-            arch: -march=x86-64-v2
-          - cc: clang
-            arch: -march=native
           - cc: gcc
+            arch: -march=x86-64-v2
+          - cc: gcc
+            arch: -march=native
+          - cc: clang
             arch: -march=x86-64-v2
     steps:
       - uses: actions/checkout@v4
