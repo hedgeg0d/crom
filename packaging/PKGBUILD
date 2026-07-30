@@ -8,7 +8,7 @@ url='https://github.com/hedgeg0d/crom'
 license=('MIT')
 makedepends=('clang' 'lld' 'python')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('503cae2ac4a0ead03a477b01d8e9e6c64465d5a0868388f8c40e01c76e0eded8')
 
 build() {
   cd "$pkgname-$pkgver"
