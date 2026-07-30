@@ -201,7 +201,8 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
         g_want_version = 1; *pi = i; return;
     }
     if (str_eq(arg, "-n") || str_eq(arg, "--name")) {
-        if (i + 1 < ac) pattern = av[++i]; *pi = i; return;
+        if (i + 1 < ac) pattern = av[++i];
+        *pi = i; return;
     }
     if (str_eq(arg, "-g") || str_eq(arg, "--glob")) {
         if (i + 1 < ac) pattern = av[++i];
@@ -223,22 +224,27 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
         *pi = i; return;
     }
     if (str_eq(arg, "-j") || str_eq(arg, "--threads")) {
-        if (i + 1 < ac) num_threads = parse_int(av[++i]); *pi = i; return;
+        if (i + 1 < ac) num_threads = parse_int(av[++i]);
+        *pi = i; return;
     }
     if (arg[0] == '-' && arg[1] == 'j' && arg[2]) {
         num_threads = parse_int(arg + 2); *pi = i; return;
     }
     if (str_eq(arg, "-t") || str_eq(arg, "--type")) {
-        if (i + 1 < ac) g_type_filter = av[++i][0]; *pi = i; return;
+        if (i + 1 < ac) g_type_filter = av[++i][0];
+        *pi = i; return;
     }
     if (str_eq(arg, "-s") || str_eq(arg, "--size")) {
-        if (i + 1 < ac) g_size_val = parse_size(av[++i]); *pi = i; return;
+        if (i + 1 < ac) g_size_val = parse_size(av[++i]);
+        *pi = i; return;
     }
     if (str_eq(arg, "--max-results")) {
-        if (i + 1 < ac) g_max_results = parse_int(av[++i]); *pi = i; return;
+        if (i + 1 < ac) g_max_results = parse_int(av[++i]);
+        *pi = i; return;
     }
     if (str_eq(arg, "--depth")) {
-        if (i + 1 < ac) g_max_depth = parse_int(av[++i]); *pi = i; return;
+        if (i + 1 < ac) g_max_depth = parse_int(av[++i]);
+        *pi = i; return;
     }
     if (str_eq(arg, "--bar")) { g_bar = 1; *pi = i; return; }
     if (str_eq(arg, "--no-bar") || str_eq(arg, "-q")) { g_bar = 0; *pi = i; return; }
@@ -263,7 +269,8 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
         *pi = i; return;
     }
     if (str_eq(arg, "-e") || str_eq(arg, "--exec")) {
-        if (i + 1 < ac) g_exec_cmd = av[++i]; *pi = i; return;
+        if (i + 1 < ac) g_exec_cmd = av[++i];
+        *pi = i; return;
     }
     if (arg[0] != '-') {
         positional(arg);
@@ -278,6 +285,8 @@ static void parse_arg(const char *arg, int ac, char **av, int *pi) {
     *pi = i;
 }
 
+/* _start is assembled separately, so LTO sees no reference and gcc drops it. */
+__attribute__((used, visibility("default")))
 int crom_main(int argc, char **argv, char **envp) {
     if (argv[0]) {
         const char *p = argv[0];

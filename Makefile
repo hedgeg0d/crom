@@ -10,7 +10,12 @@ CFLAGS   := -nostdlib -ffreestanding -static -O3 $(ARCH_FLAGS) -pipe \
             -DCROM_VERSION=\"$(VERSION)\" \
             -Wall -Wextra -Wno-unused-parameter
 ASFLAGS  := -nostdlib -static
-LDFLAGS  := -nostdlib -static -Wl,--gc-sections -Wl,--strip-all -fuse-ld=lld
+# lld only with clang: gcc's LTO plugin and lld disagree about crom_main, which
+# only start.S references, and the link fails with it undefined.
+ifneq (,$(findstring clang,$(CC)))
+USE_LLD  := -fuse-ld=lld
+endif
+LDFLAGS  := -nostdlib -static -Wl,--gc-sections -Wl,--strip-all $(USE_LLD)
 TARGET   := build/crom
 PREFIX   := /usr/local
 SRCDIR   := src

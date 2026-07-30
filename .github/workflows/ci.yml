@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: clang
+            arch: -march=x86-64-v2
+          - cc: clang
+            arch: -march=native
+          - cc: gcc
+            arch: -march=x86-64-v2
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld ripgrep fd-find
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+      - name: build
+        run: make CC=${{ matrix.cc }} ARCH_FLAGS=${{ matrix.arch }}
+      - name: version
+        run: ./build/crom --version
+      - name: tests
+        run: make test-compare
+      - name: tests, single threaded
+        run: CROM_EXTRA="-j 1" bash tests/run.sh
+      - name: install into a staging tree
+        run: |
+          make install DESTDIR="$PWD/stage" PREFIX=/usr
+          test -x stage/usr/bin/crom
+          test -f stage/usr/share/man/man1/crom.1

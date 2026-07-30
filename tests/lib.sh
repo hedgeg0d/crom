@@ -8,7 +8,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CROM=${CROM:-$ROOT/build/crom}
 
 # Ignore any ~/.cromrc: a stray --bar there would change what we measure.
-CROM_ARGS=(--no-config)
+# CROM_EXTRA lets a caller run the whole suite with extra flags, e.g. -j 1.
+CROM_ARGS=(--no-config ${CROM_EXTRA:-})
 
 if [ -t 1 ]; then
     C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_HEAD=$'\033[1m'
