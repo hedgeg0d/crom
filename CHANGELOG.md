@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 — 2026-07-30
+
+### Fixed
+* A glob with several `*` and no literal tail backtracked exponentially:
+  `a*a*a*a*a*a*a*a*a*b*` against a 64 character name ran for over 30 seconds,
+  where find answers in two. The matcher keeps a single backtrack point now.
+  Checked against `find -name` over 606 patterns and 400 names.
+
+### Changed
+* Built with `gcc -O2` by default instead of `clang -O3`: measurably faster
+  here (15% on content search, 17% on the parallel case) on two corpora.
+  gcc `-O3` is twice the size and slower than `-O2` on this code. clang still
+  builds with `make CC=clang`.
+
 ## 0.3.0 — 2026-07-30
 
 First release meant for other people's machines.

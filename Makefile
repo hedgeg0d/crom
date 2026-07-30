@@ -1,4 +1,4 @@
-VERSION  := 0.3.0
+VERSION  := 0.3.1
 
 # gcc -O2 measured fastest here: 15% over clang -O3 on content search, and gcc
 # -O3 is both larger and slower than -O2 on this code.

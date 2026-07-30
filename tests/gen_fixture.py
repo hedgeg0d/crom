@@ -106,7 +106,8 @@ def correctness(d):
     # -- names for the matcher: substring, smart case, anchoring -------------
     # Deliberately empty so this subtree cannot disturb any content counts.
     for p in ("Makefile", "makefile.old", "notes.PDF", "paper.pdf",
-              "sub/MyPdfFile.txt", "file", "myfile.c", "profile"):
+              "sub/MyPdfFile.txt", "file", "myfile.c", "profile",
+              "a" * 64):
         w(f"{d}/names/{p}", b"")
     meta["N_PDF_ANY"] = 3              # notes.PDF paper.pdf sub/MyPdfFile.txt
     meta["N_PDF_STRICT"] = 1           # 'PDF' has a capital: notes.PDF only
@@ -115,7 +116,7 @@ def correctness(d):
     meta["N_GLOB_PDF"] = 2             # *.pdf folded: notes.PDF paper.pdf
     meta["N_GLOB_PDF_CS"] = 1          # *.pdf strict: paper.pdf
     meta["N_MAKE_CAP"] = 2             # 'M*' strict: Makefile MyPdfFile.txt
-    meta["N_NAMES_TOTAL"] = 8
+    meta["N_NAMES_TOTAL"] = 9
 
     # -- hidden entries: skipped unless -H ----------------------------------
     w(f"{d}/hide/visible.txt", NEEDLE + b"\n")

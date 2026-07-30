@@ -91,6 +91,9 @@ count "glob capital stays strict" "$N_MAKE_CAP"   crom 'M*' "$F/names"
 count "? still matches one char"  1               crom '?ile' "$F/names"
 count "[class] still works"       1               crom '[mM]akefile' "$F/names"
 count "-g with a glob is a glob"  "$N_GLOB_PDF"   crom -g '*.pdf' "$F/names"
+# a recursive matcher took over 30s on this; it must stay linear
+rc "many stars do not blow up" 1 timeout 10 "$CROM" "${CROM_ARGS[@]}" \
+   'a*a*a*a*a*a*a*a*a*a*b*' "$F/names"
 count "no match"                  0               crom zzznope "$F/names"
 
 head_ "hidden entries"
